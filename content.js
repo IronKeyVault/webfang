@@ -14,6 +14,9 @@
   let historyStack = [];
   let prepared = null; // { item, html, text }
   let stripLinks = false; // fjern links helt (kun tekst)
+  let lastQuizCount = 0;  // diagnostik: antal quiz-svar bevaret ved sidste optag
+  let lastQuizInputs = 0; // diagnostik: antal rå input/role-svar fundet i klonen
+  let lastQuizRows = 0;   // diagnostik: antal svar-rækker samlet i rowSet
 
   // ---- UI-elementer -------------------------------------------------------
 
@@ -51,12 +54,13 @@
 
   const btnLess = mkBtn('⬇ Mindre');
   const btnMore = mkBtn('⬆ Mere');
+  const btnAll = mkBtn('📄 Hele siden');
   const btnLinks = mkBtn('🔗 Links: til');
   const btnCopy = mkBtn('📋 Kopiér');
   btnCopy.style.background = '#2563eb';
   const btnCancel = mkBtn('✕');
 
-  toolbar.append(status, btnLess, btnMore, btnLinks, btnCopy, btnCancel);
+  toolbar.append(status, btnLess, btnMore, btnAll, btnLinks, btnCopy, btnCancel);
 
   const toast = (() => {
     const t = document.createElement('div');
@@ -155,6 +159,28 @@
     prepare();
   };
 
+  // Find sidens hoved-indhold (fanger alt uanset hvor man klikkede).
+  function pickMainRoot() {
+    const cand = document.querySelector('main, [role="main"], article');
+    if (cand && (cand.textContent || '').trim().length > 200) return cand;
+    let best = document.body, bestLen = 0;
+    document.body.querySelectorAll('div, section').forEach((el) => {
+      const r = el.getBoundingClientRect();
+      if (r.width < 250 || r.height < 250) return; // spring små/skjulte over
+      const len = (el.textContent || '').length;
+      if (len > bestLen) { bestLen = len; best = el; }
+    });
+    return best;
+  }
+
+  btnAll.onclick = () => {
+    const root = pickMainRoot();
+    if (currentEl && currentEl !== root) historyStack.push(currentEl);
+    currentEl = root;
+    positionOverlay(currentEl);
+    prepare();
+  };
+
   btnLinks.onclick = () => {
     stripLinks = !stripLinks;
     btnLinks.textContent = stripLinks ? '🔗 Links: fra' : '🔗 Links: til';
@@ -229,7 +255,8 @@
     btnCopy.style.cursor = 'default';
   }
   function setReady(imgCount) {
-    status.textContent = `Klar (${imgCount} billeder)`;
+    const quiz = lastQuizCount ? `, ${lastQuizCount} quiz-svar` : '';
+    status.textContent = `Klar (${imgCount} billeder${quiz})`;
     btnCopy.disabled = false;
     btnCopy.style.opacity = '1';
     btnCopy.style.cursor = 'pointer';
@@ -300,6 +327,8 @@
   }
 
   function clean(root, opts = {}) {
+    lastQuizCount = 0;
+    lastQuizInputs = 0;
     // 1) Tekniske/ikke-indholds-tags væk.
     root.querySelectorAll(
       'script, style, noscript, iframe, canvas, link, object, embed, template'
@@ -358,71 +387,123 @@
     root.querySelectorAll('[class*="vjs-"], [class*="transcript"]')
       .forEach((n) => n.remove());
 
-    // 1c) Quiz: udtræk svar-muligheder (checkbox/radio) til en punktliste, FØR
-    //     step 2 fjerner input/label/form. Ellers forsvinder svarene helt.
-    //     Korrekte svar (afkrydset / "correct"-klasse / grøn baggrund) markeres
-    //     grønt + ✓. "Korrekt"-status aflæses fra det LEVENDE element (opts.liveRoot),
-    //     da cloneNode ikke bevarer checkbox-tilstanden pålideligt.
-    const OPT_SEL = 'input[type="checkbox"], input[type="radio"]';
-    const optInputs = [...root.querySelectorAll(OPT_SEL)];
-    if (optInputs.length) {
-      const liveInputs = opts.liveRoot ? [...opts.liveRoot.querySelectorAll(OPT_SEL)] : [];
+    // 1c) Quiz: konvertér svar-muligheder til punkter PÅ STEDET (så flere quizzer
+    //     hver især bevares), FØR step 2 fjerner input/label/button/form.
+    //     Håndterer både rigtige <input> OG custom klikbare rækker (role=radio
+    //     eller "fake radio" med en rounded-full-markør), som Cisco U. bruger.
+    {
       const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : s);
 
-      const isCorrect = (liveInput) => {
-        if (!liveInput) return false;
-        if (liveInput.checked) return true;
-        const lr = liveInput.closest(
-          'label, li, [class*="option"], [class*="answer"], [class*="choice"]'
-        ) || liveInput.parentElement;
-        if (!lr) return false;
-        if (/correct|is-?correct|answer-?correct|right\b/i.test(lr.className || '')) return true;
-        try {
-          const m = getComputedStyle(lr).backgroundColor
-            .match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-          if (m) {
-            const r = +m[1], g = +m[2], b = +m[3];
-            // Grønlig baggrund (og ikke bare hvid/lys grå).
-            if (g > r + 5 && g > b + 5 && !(r > 240 && g > 240 && b > 240)) return true;
-          }
-        } catch (_) {}
-        return false;
+      // Diagnostik: hvor mange rå svar-elementer ligger overhovedet i klonen?
+      lastQuizInputs = root.querySelectorAll(
+        'input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"], [role="option"]'
+      ).length;
+
+      // Saml svar-rækker i dokument-rækkefølge uden dubletter/indlejrede.
+      const rowSet = [];
+      const pushRow = (el) => {
+        if (!el || el === root || !root.contains(el)) return;
+        for (const r of rowSet) { if (r === el || r.contains(el) || el.contains(r)) return; }
+        rowSet.push(el);
       };
 
-      const rows = [];
-      const items = [];
-      optInputs.forEach((input, i) => {
+      // a) Rigtige <input type=radio/checkbox>.
+      root.querySelectorAll('input[type="radio"], input[type="checkbox"]').forEach((input) => {
         const label = input.closest('label') ||
           (input.id ? root.querySelector('label[for="' + esc(input.id) + '"]') : null);
         const row = label ||
-          input.closest('li, [class*="option"], [class*="answer"], [class*="choice"], [class*="radio"], [class*="checkbox"]') ||
-          input;
-        const text = ((label || row).textContent || '').replace(/\s+/g, ' ').trim();
-        if (text && row !== input) items.push({ text, correct: isCorrect(liveInputs[i]) });
-        rows.push(row);
+          input.closest('li, button, [role="radio"], [role="checkbox"], [class*="option"], [class*="answer"], [class*="choice"]') ||
+          input.parentElement || input;
+        pushRow(row);
+      });
+      // b) Custom role-baserede svar.
+      root.querySelectorAll('[role="radio"], [role="checkbox"], [role="option"]').forEach(pushRow);
+      // c) "Fake radio": lille rund markør → nærmeste klikbare/labelled række.
+      //    Kun hvis markøren indgår i en GRUPPE (≥2), så avatarer/ikoner udelukkes.
+      root.querySelectorAll('[class*="rounded-full"]').forEach((marker) => {
+        const group = marker.parentElement && marker.parentElement.parentElement;
+        if (!group || group.querySelectorAll('[class*="rounded-full"]').length < 2) return;
+        let row = marker.closest(
+          'button, label, li, a[role], [role="button"], [class*="answer"], [class*="/ans"], [class*="option"], [class*="choice"]'
+        );
+        if (!row) {
+          let p = marker.parentElement;
+          while (p && p !== root && !(p.textContent || '').trim()) p = p.parentElement;
+          row = p;
+        }
+        if (row && (row.textContent || '').trim()) pushRow(row);
       });
 
-      if (items.length) {
-        const ul = document.createElement('ul');
-        items.forEach(({ text, correct }) => {
-          const li = document.createElement('li');
+      lastQuizRows = rowSet.length;
+
+      if (rowSet.length) {
+        // Live-rækker til computed-style-fallback (grøn baggrund), matchet på tekst.
+        const liveRows = opts.liveRoot ? [...opts.liveRoot.querySelectorAll(
+          'input[type=radio],input[type=checkbox],[role=radio],[role=checkbox],[role=option],button,label,li'
+        )] : [];
+        const findLive = (row) => {
+          const t = (row.textContent || '').replace(/\s+/g, ' ').trim();
+          if (!t) return null;
+          return liveRows.find((lr) => (lr.textContent || '').replace(/\s+/g, ' ').trim() === t) || null;
+        };
+        const greenBg = (el) => {
+          try {
+            const m = getComputedStyle(el).backgroundColor.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+            if (m) { const r = +m[1], g = +m[2], b = +m[3];
+              return g > r + 5 && g > b + 5 && !(r > 240 && g > 240 && b > 240); }
+          } catch (_) {}
+          return false;
+        };
+        const isCorrect = (row) => {
+          // Tjek KUN svarets egen boks (dets eget <li>/option-element), IKKE delte
+          // forældre – ellers "smitter" et valgt svar af på alle svar i samme quiz.
+          const box = row.closest(
+            'li, [class*="answer-option"], [class*="answer"], [class*="option"], [role="radio"], [role="checkbox"]'
+          ) || row;
+          const cls = (box.className && box.className.toString()) || '';
+          if (/\b(is-)?correct\b|answer-correct|right-answer|border-green|bg-green|bg-lime|bg-emerald/i.test(cls)) return true;
+          if (box.getAttribute && box.getAttribute('aria-checked') === 'true') return true;
+          const inp = box.querySelector && box.querySelector('input[type="radio"], input[type="checkbox"]');
+          if (inp && inp.hasAttribute('checked')) return true;
+          // Live: grøn baggrund på svarets egen boks (ikke forældre).
+          const live = findLive(row);
+          const liveBox = live ? (live.closest(
+            'li, [class*="answer"], [class*="option"], [role="radio"], [role="checkbox"]'
+          ) || live) : null;
+          if (liveBox && greenBg(liveBox)) return true;
+          return false;
+        };
+
+        // Erstat hver svar-række PÅ STEDET med et punkt (bevarer placering pr. quiz).
+        const quizForms = new Set();
+        rowSet.forEach((row) => {
+          if (!root.contains(row)) return; // klonen er detached → brug contains, ikke isConnected
+          const form = row.closest('form, fieldset');
+          if (form && root.contains(form)) quizForms.add(form);
+          const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
+          if (!text) { row.remove(); return; }
+          const correct = isCorrect(row);
+          const p = document.createElement('p');
+          p.setAttribute('style', 'margin:2px 0');
           if (correct) {
-            // Word dropper farve/highlight ved "Merge Formatting", men beholder
-            // fed – så korrekte svar markeres med fed tekst + ✓.
             const b = document.createElement('b');
-            b.textContent = '✓ ' + text;
-            li.appendChild(b);
+            b.textContent = '• ✓ ' + text;
+            p.appendChild(b);
           } else {
-            li.textContent = text;
+            p.textContent = '• ' + text;
           }
-          ul.appendChild(li);
+          row.replaceWith(p);
+          lastQuizCount++;
         });
-        // Indsæt listen uden for en evt. <form>/<fieldset> (som fjernes i step 2).
-        const anchor = rows[0];
-        const target = anchor.closest('form, fieldset') || anchor;
-        if (target.parentNode) target.parentNode.insertBefore(ul, target);
+
+        // Beskyt quiz-<form>/<fieldset> mod at blive slettet helt i step 2.
+        quizForms.forEach((f) => {
+          if (!root.contains(f)) return;
+          const div = document.createElement('div');
+          while (f.firstChild) div.appendChild(f.firstChild);
+          f.replaceWith(div);
+        });
       }
-      rows.forEach((r) => { if (r && r.isConnected && r !== root) r.remove(); });
     }
 
     // Sikkerhedsnet: fjern løsrevne afspiller-status-linjer selv uden vjs-klasse.
