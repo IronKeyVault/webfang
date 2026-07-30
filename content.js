@@ -194,7 +194,7 @@
 
     // 2) Klon og rens.
     const clone = currentEl.cloneNode(true);
-    clean(clone, { stripLinks });
+    clean(clone, { stripLinks, liveRoot: currentEl });
     absolutize(clone);
 
     // 3) Saml billed-URL'er og få dem inlinet af baggrunds-workeren.
@@ -323,29 +323,61 @@
 
     // 1c) Quiz: udtræk svar-muligheder (checkbox/radio) til en punktliste, FØR
     //     step 2 fjerner input/label/form. Ellers forsvinder svarene helt.
-    const optInputs = [...root.querySelectorAll(
-      'input[type="checkbox"], input[type="radio"]'
-    )];
+    //     Korrekte svar (afkrydset / "correct"-klasse / grøn baggrund) markeres
+    //     grønt + ✓. "Korrekt"-status aflæses fra det LEVENDE element (opts.liveRoot),
+    //     da cloneNode ikke bevarer checkbox-tilstanden pålideligt.
+    const OPT_SEL = 'input[type="checkbox"], input[type="radio"]';
+    const optInputs = [...root.querySelectorAll(OPT_SEL)];
     if (optInputs.length) {
+      const liveInputs = opts.liveRoot ? [...opts.liveRoot.querySelectorAll(OPT_SEL)] : [];
       const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : s);
+
+      const isCorrect = (liveInput) => {
+        if (!liveInput) return false;
+        if (liveInput.checked) return true;
+        const lr = liveInput.closest(
+          'label, li, [class*="option"], [class*="answer"], [class*="choice"]'
+        ) || liveInput.parentElement;
+        if (!lr) return false;
+        if (/correct|is-?correct|answer-?correct|right\b/i.test(lr.className || '')) return true;
+        try {
+          const m = getComputedStyle(lr).backgroundColor
+            .match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+          if (m) {
+            const r = +m[1], g = +m[2], b = +m[3];
+            // Grønlig baggrund (og ikke bare hvid/lys grå).
+            if (g > r + 5 && g > b + 5 && !(r > 240 && g > 240 && b > 240)) return true;
+          }
+        } catch (_) {}
+        return false;
+      };
+
       const rows = [];
-      const texts = [];
-      optInputs.forEach((input) => {
+      const items = [];
+      optInputs.forEach((input, i) => {
         const label = input.closest('label') ||
           (input.id ? root.querySelector('label[for="' + esc(input.id) + '"]') : null);
-        // Vælg en snæver "række" – helst label, ellers en option-agtig container.
         const row = label ||
           input.closest('li, [class*="option"], [class*="answer"], [class*="choice"], [class*="radio"], [class*="checkbox"]') ||
           input;
         const text = ((label || row).textContent || '').replace(/\s+/g, ' ').trim();
-        if (text && row !== input) texts.push(text);
+        if (text && row !== input) items.push({ text, correct: isCorrect(liveInputs[i]) });
         rows.push(row);
       });
-      if (texts.length) {
+
+      if (items.length) {
         const ul = document.createElement('ul');
-        texts.forEach((t) => {
+        items.forEach(({ text, correct }) => {
           const li = document.createElement('li');
-          li.textContent = t;
+          if (correct) {
+            // Word dropper farve/highlight ved "Merge Formatting", men beholder
+            // fed – så korrekte svar markeres med fed tekst + ✓.
+            const b = document.createElement('b');
+            b.textContent = '✓ ' + text;
+            li.appendChild(b);
+          } else {
+            li.textContent = text;
+          }
           ul.appendChild(li);
         });
         // Indsæt listen uden for en evt. <form>/<fieldset> (som fjernes i step 2).

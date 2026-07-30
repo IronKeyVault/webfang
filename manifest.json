@@ -12,6 +12,12 @@
   "background": {
     "service_worker": "background.js"
   },
+  "commands": {
+    "start-pick": {
+      "suggested_key": { "default": "Ctrl+Shift+Z" },
+      "description": "Optag artikel med Webfang"
+    }
+  },
   "content_scripts": [
     {
       "matches": ["<all_urls>"],

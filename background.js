@@ -8,6 +8,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 });
 
+// Genvejstast (Ctrl+Shift+Y) → start optag direkte på den aktive fane.
+chrome.commands.onCommand.addListener(async (command) => {
+  if (command !== 'start-pick') return;
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab || !tab.id) return;
+  try {
+    await chrome.tabs.sendMessage(tab.id, { type: 'START_PICK' });
+  } catch (e) {
+    // Content-scriptet er ikke injiceret endnu → injicér og prøv igen.
+    try {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+      await chrome.tabs.sendMessage(tab.id, { type: 'START_PICK' });
+    } catch (_) {
+      // Fx chrome://- eller store-sider hvor scripts ikke må køre.
+    }
+  }
+});
+
 async function inlineAll(urls) {
   const out = {};
   await Promise.all(
