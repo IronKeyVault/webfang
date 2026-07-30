@@ -572,9 +572,27 @@
 
   // ---- Livscyklus ---------------------------------------------------------
 
+  function scrollAllToTop() {
+    // Vinduet + dokumentets scroll-element.
+    window.scrollTo(0, 0);
+    const se = document.scrollingElement || document.documentElement;
+    if (se) se.scrollTop = 0;
+    if (document.body) document.body.scrollTop = 0;
+    // Indre scroll-containere (mange sider scroller i en div, ikke vinduet).
+    document.querySelectorAll('*').forEach((el) => {
+      if (el.scrollTop > 0 && !overlay.contains(el) && !toolbar.contains(el)) {
+        el.scrollTop = 0;
+      }
+    });
+  }
+
   function startPick() {
     if (phase !== 'idle') return;
     phase = 'hover';
+    // Scroll til toppen så du markerer fra artiklens start.
+    scrollAllToTop();
+    // Nogle sider scroller tilbage et øjeblik efter – nulstil igen.
+    setTimeout(scrollAllToTop, 60);
     mount();
     toolbar.style.display = 'none';
     document.addEventListener('mousemove', onMove, true);
