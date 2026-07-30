@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="da">
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { width: 240px; font-family: system-ui, sans-serif; margin: 0; padding: 16px; }
+    h1 { font-size: 14px; margin: 0 0 4px; }
+    p { font-size: 12px; color: #555; margin: 0 0 12px; line-height: 1.4; }
+    button {
+      width: 100%; padding: 10px; font-size: 14px; font-weight: 600;
+      color: #fff; background: #2563eb; border: none; border-radius: 8px; cursor: pointer;
+    }
+    button:hover { background: #1d4ed8; }
+    .hint { font-size: 11px; color: #888; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>📋 Webfang</h1>
+  <p>Tryk Optag, klik på artiklen, og den kopieres med billeder til udklipsholderen.</p>
+  <button id="start">Optag artikel</button>
+  <div class="hint">Indsæt bagefter med Ctrl+V i Word, OneNote eller mail.</div>
+  <script src="popup.js"></script>
+</body>
+</html>
