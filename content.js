@@ -184,7 +184,10 @@
 
   async function prepare() {
     prepared = null;
-    setBusy('Henter billeder…');
+    setBusy('Udfolder & henter…');
+
+    // 0) Udfold sammenklappet indhold ("Show Me", accordions, <details>).
+    await expandCollapsibles(currentEl);
 
     // 1) Scroll hele siden igennem én gang, så lazy-billeder loades.
     await autoScroll();
@@ -246,6 +249,40 @@
     await sleep(150);
     window.scrollTo(0, originalY);
     await sleep(50);
+  }
+
+  // Udfold sammenklappet indhold: <details>, "Show Me"/"Show more"-toggles og
+  // aria-expanded=false, så skjult tekst kommer med i optaget.
+  async function expandCollapsibles(rootEl) {
+    if (!rootEl) return;
+    let clicked = 0;
+
+    // <details> åbnes direkte.
+    rootEl.querySelectorAll('details:not([open])').forEach((d) => {
+      d.open = true; clicked++;
+    });
+
+    const TOGGLE_TXT = /^(show me|show more|show answer|show details|show solution|vis mere|vis svar|læs mere|read more|expand|reveal)\b/i;
+    const candidates = rootEl.querySelectorAll(
+      'a, button, summary, [role="button"], [aria-expanded="false"], ' +
+      '[class*="show"], [class*="toggle"], [class*="expand"], [class*="accordion"], [class*="collaps"]'
+    );
+    candidates.forEach((el) => {
+      // Undgå at navigere væk: spring links over der peger på en rigtig side.
+      if (el.tagName === 'A') {
+        const href = el.getAttribute('href') || '';
+        if (href && !href.startsWith('#') && !/^javascript:/i.test(href)) return;
+      }
+      const collapsed = el.getAttribute('aria-expanded') === 'false';
+      const txt = (el.textContent || '').trim();
+      // Klik kun hvis den ser sammenklappet ud – undgå at lukke åbne igen.
+      if (collapsed || (txt.length < 30 && TOGGLE_TXT.test(txt))) {
+        try { el.click(); clicked++; } catch (_) {}
+      }
+    });
+
+    // Giv udfoldet indhold (evt. netværkskald) tid til at dukke op.
+    if (clicked) await sleep(400);
   }
 
   // ---- Rensning & billed-håndtering --------------------------------------
