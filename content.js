@@ -321,6 +321,41 @@
     root.querySelectorAll('[class*="vjs-"], [class*="transcript"]')
       .forEach((n) => n.remove());
 
+    // 1c) Quiz: udtræk svar-muligheder (checkbox/radio) til en punktliste, FØR
+    //     step 2 fjerner input/label/form. Ellers forsvinder svarene helt.
+    const optInputs = [...root.querySelectorAll(
+      'input[type="checkbox"], input[type="radio"]'
+    )];
+    if (optInputs.length) {
+      const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : s);
+      const rows = [];
+      const texts = [];
+      optInputs.forEach((input) => {
+        const label = input.closest('label') ||
+          (input.id ? root.querySelector('label[for="' + esc(input.id) + '"]') : null);
+        // Vælg en snæver "række" – helst label, ellers en option-agtig container.
+        const row = label ||
+          input.closest('li, [class*="option"], [class*="answer"], [class*="choice"], [class*="radio"], [class*="checkbox"]') ||
+          input;
+        const text = ((label || row).textContent || '').replace(/\s+/g, ' ').trim();
+        if (text && row !== input) texts.push(text);
+        rows.push(row);
+      });
+      if (texts.length) {
+        const ul = document.createElement('ul');
+        texts.forEach((t) => {
+          const li = document.createElement('li');
+          li.textContent = t;
+          ul.appendChild(li);
+        });
+        // Indsæt listen uden for en evt. <form>/<fieldset> (som fjernes i step 2).
+        const anchor = rows[0];
+        const target = anchor.closest('form, fieldset') || anchor;
+        if (target.parentNode) target.parentNode.insertBefore(ul, target);
+      }
+      rows.forEach((r) => { if (r && r.isConnected && r !== root) r.remove(); });
+    }
+
     // Sikkerhedsnet: fjern løsrevne afspiller-status-linjer selv uden vjs-klasse.
     const PLAYER_TXT = /^(video player is loading|current time\b|duration\b|loaded:|stream type|remaining time|progress\b|playback rate|open transcript|close transcript|mute|unmute|fullscreen|picture-in-picture)/i;
     root.querySelectorAll('span, div, p, li, button, a').forEach((n) => {
