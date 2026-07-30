@@ -13,6 +13,7 @@
   let currentEl = null;
   let historyStack = [];
   let prepared = null; // { item, html, text }
+  let stripLinks = false; // fjern links helt (kun tekst)
 
   // ---- UI-elementer -------------------------------------------------------
 
@@ -50,11 +51,12 @@
 
   const btnLess = mkBtn('⬇ Mindre');
   const btnMore = mkBtn('⬆ Mere');
+  const btnLinks = mkBtn('🔗 Links: til');
   const btnCopy = mkBtn('📋 Kopiér');
   btnCopy.style.background = '#2563eb';
   const btnCancel = mkBtn('✕');
 
-  toolbar.append(status, btnLess, btnMore, btnCopy, btnCancel);
+  toolbar.append(status, btnLess, btnMore, btnLinks, btnCopy, btnCancel);
 
   const toast = (() => {
     const t = document.createElement('div');
@@ -153,6 +155,13 @@
     prepare();
   };
 
+  btnLinks.onclick = () => {
+    stripLinks = !stripLinks;
+    btnLinks.textContent = stripLinks ? '🔗 Links: fra' : '🔗 Links: til';
+    btnLinks.style.background = stripLinks ? '#b45309' : '#374151';
+    prepare();
+  };
+
   btnCancel.onclick = () => teardown();
 
   btnCopy.onclick = async () => {
@@ -185,7 +194,7 @@
 
     // 2) Klon og rens.
     const clone = currentEl.cloneNode(true);
-    clean(clone);
+    clean(clone, { stripLinks });
     absolutize(clone);
 
     // 3) Saml billed-URL'er og få dem inlinet af baggrunds-workeren.
@@ -241,16 +250,145 @@
 
   // ---- Rensning & billed-håndtering --------------------------------------
 
-  function clean(root) {
+  // Nøgleord der typisk peger på NON-artikel-indhold (menuer, del-knapper,
+  // relaterede-artikler, reklamer, kommentarer osv.).
+  const JUNK_RE = /(^|[\s_-])(share|social|related|recirc|newsletter|subscribe|promo|advert|adslot|ad-|-ad|sponsor|comment|sidebar|side-bar|breadcrumb|nav|navbar|menu|toolbar|tags?|taglist|byline|author-?bio|cookie|consent|gdpr|popup|modal|overlay|footer|masthead|subnav|pagination|read-?more|more-?stories|trending|popular|recommend|widget|banner|social-share|post-nav|skip-link|screen-?reader|visually-hidden)([\s_-]|$)/i;
+
+  function looksJunk(el) {
+    const id = el.id || '';
+    const cls = typeof el.className === 'string' ? el.className : '';
+    const role = (el.getAttribute && el.getAttribute('role')) || '';
+    return JUNK_RE.test(id) || JUNK_RE.test(cls) ||
+      /^(navigation|complementary|banner|contentinfo|search)$/.test(role);
+  }
+
+  function clean(root, opts = {}) {
+    // 1) Tekniske/ikke-indholds-tags væk.
     root.querySelectorAll(
       'script, style, noscript, iframe, canvas, link, object, embed, template'
     ).forEach((n) => n.remove());
-    // Fjern indlejrede handlers.
+
+    // 1b) Video (video.js m.fl.): erstat HELE afspilleren med dens plakat-billede.
+    //     Wrapperen ".video-js" har selv vjs-klasser (fx vjs-paused), så vi kan
+    //     ikke bare fjerne alt "vjs-" – vi trækker plakaten ud som rent <img>
+    //     og udskifter hele afspilleren (kontrol/status-tekst ryger dermed med).
+    const extractPoster = (player) => {
+      // a) rigtigt <img> i plakaten (nyere video.js: <picture>/<img>).
+      const innerImg = player.querySelector(
+        '.vjs-poster img, img.vjs-poster-img, [class*="poster"] img'
+      );
+      if (innerImg && (innerImg.getAttribute('src') || innerImg.getAttribute('srcset'))) {
+        const img = document.createElement('img');
+        if (innerImg.getAttribute('src')) img.setAttribute('src', innerImg.getAttribute('src'));
+        if (innerImg.getAttribute('srcset')) img.setAttribute('srcset', innerImg.getAttribute('srcset'));
+        return img;
+      }
+      // b) background-image på .vjs-poster.
+      const pEl = player.querySelector('.vjs-poster, [class*="poster"]');
+      const m = pEl && (pEl.getAttribute('style') || '').match(/url\(["']?(.*?)["']?\)/);
+      if (m && m[1]) {
+        const img = document.createElement('img');
+        img.setAttribute('src', m[1]);
+        return img;
+      }
+      // c) <video poster="...">.
+      const v = player.querySelector('video[poster]');
+      if (v) {
+        const img = document.createElement('img');
+        img.setAttribute('src', v.getAttribute('poster'));
+        return img;
+      }
+      return null;
+    };
+
+    root.querySelectorAll('.video-js, [data-vjs-player], [class*="videoplayer"]').forEach((player) => {
+      const img = extractPoster(player);
+      if (img) player.replaceWith(img);
+      else player.remove();
+    });
+
+    // Rester: løse <video>-tags og evt. vjs-elementer uden for en .video-js-wrapper.
+    root.querySelectorAll('video').forEach((v) => {
+      const poster = v.getAttribute('poster');
+      if (poster) {
+        const img = document.createElement('img');
+        img.setAttribute('src', poster);
+        v.replaceWith(img);
+      } else {
+        v.remove();
+      }
+    });
+    root.querySelectorAll('[class*="vjs-"], [class*="transcript"]')
+      .forEach((n) => n.remove());
+
+    // Sikkerhedsnet: fjern løsrevne afspiller-status-linjer selv uden vjs-klasse.
+    const PLAYER_TXT = /^(video player is loading|current time\b|duration\b|loaded:|stream type|remaining time|progress\b|playback rate|open transcript|close transcript|mute|unmute|fullscreen|picture-in-picture)/i;
+    root.querySelectorAll('span, div, p, li, button, a').forEach((n) => {
+      if (n.children.length === 0) {
+        const t = (n.textContent || '').trim();
+        if (t && t.length < 40 && PLAYER_TXT.test(t)) n.remove();
+      }
+    });
+
+    // 2) Strukturel navigation/UI der aldrig er selve artiklen.
+    //    (header beholdes bevidst – artiklens titel ligger tit deri.)
+    root.querySelectorAll(
+      'nav, aside, footer, form, button, input, select, textarea, label, fieldset, ' +
+      '[role="navigation"], [role="complementary"], [role="banner"], ' +
+      '[role="contentinfo"], [role="search"], [aria-hidden="true"], [hidden]'
+    ).forEach((n) => n.remove());
+
+    // 3) Elementer hvis class/id/role skriger "reklame/del/relateret/menu".
+    root.querySelectorAll('*').forEach((n) => {
+      if (looksJunk(n)) n.remove();
+    });
+
+    // 4) Fjern lister der reelt bare er link-samlinger (menuer/relaterede).
+    root.querySelectorAll('ul, ol').forEach((list) => {
+      const items = [...list.children].filter((c) => c.tagName === 'LI');
+      if (items.length >= 3) {
+        const linky = items.filter((li) => {
+          const txt = (li.textContent || '').trim();
+          const linkTxt = [...li.querySelectorAll('a')]
+            .map((a) => (a.textContent || '').trim()).join('');
+          return txt.length > 0 && linkTxt.length >= txt.length * 0.9;
+        });
+        if (linky.length >= items.length * 0.8) list.remove();
+      }
+    });
+
+    // 5) Valgfrit: fjern links helt (behold kun teksten).
+    if (opts.stripLinks) {
+      root.querySelectorAll('a').forEach((a) => {
+        a.replaceWith(document.createTextNode(a.textContent || ''));
+      });
+    }
+
+    // 6) Fjern indlejrede event-handlers.
     root.querySelectorAll('*').forEach((n) => {
       [...n.attributes].forEach((a) => {
         if (a.name.startsWith('on')) n.removeAttribute(a.name);
       });
     });
+
+    // 7) Ryd op i nu-tomme wrappers.
+    root.querySelectorAll('div, span, section, p').forEach((n) => {
+      if (!n.querySelector('img') && !(n.textContent || '').trim()) n.remove();
+    });
+
+    // 8) Fjern løsrevne "bare-link"-blokke i toppen og bunden (fx "tilbage til…",
+    //    "næste side"). Beholder overskrifter og billeder, så titlen ikke ryger.
+    const isBareLink = (el) => {
+      if (!el || el.nodeType !== 1) return false;
+      if (el.querySelector('img, h1, h2, h3, h4, h5, h6')) return false;
+      const links = el.tagName === 'A' ? [el] : [...el.querySelectorAll('a')];
+      if (links.length !== 1) return false;
+      const txt = (el.textContent || '').trim();
+      const linkTxt = (links[0].textContent || '').trim();
+      return txt.length > 0 && txt === linkTxt && txt.length < 100;
+    };
+    while (isBareLink(root.firstElementChild)) root.firstElementChild.remove();
+    while (isBareLink(root.lastElementChild)) root.lastElementChild.remove();
   }
 
   function absolutize(root) {
