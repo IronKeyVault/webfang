@@ -14,9 +14,8 @@
   let historyStack = [];
   let prepared = null; // { item, html, text }
   let stripLinks = false; // fjern links helt (kun tekst)
-  let lastQuizCount = 0;  // diagnostik: antal quiz-svar bevaret ved sidste optag
-  let lastQuizInputs = 0; // diagnostik: antal rå input/role-svar fundet i klonen
-  let lastQuizRows = 0;   // diagnostik: antal svar-rækker samlet i rowSet
+  let lastQuizCount = 0;   // antal quiz-svar bevaret ved sidste optag
+  let lastQuizGroups = 0;  // antal distinkte quizzer (spørgsmål) ved sidste optag
 
   // ---- UI-elementer -------------------------------------------------------
 
@@ -255,7 +254,8 @@
     btnCopy.style.cursor = 'default';
   }
   function setReady(imgCount) {
-    const quiz = lastQuizCount ? `, ${lastQuizCount} quiz-svar` : '';
+    const quiz = lastQuizGroups
+      ? `, ${lastQuizGroups} quiz (${lastQuizCount} svar)` : '';
     status.textContent = `Klar (${imgCount} billeder${quiz})`;
     btnCopy.disabled = false;
     btnCopy.style.opacity = '1';
@@ -328,7 +328,7 @@
 
   function clean(root, opts = {}) {
     lastQuizCount = 0;
-    lastQuizInputs = 0;
+    lastQuizGroups = 0;
     // 1) Tekniske/ikke-indholds-tags væk.
     root.querySelectorAll(
       'script, style, noscript, iframe, canvas, link, object, embed, template'
@@ -394,11 +394,6 @@
     {
       const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : s);
 
-      // Diagnostik: hvor mange rå svar-elementer ligger overhovedet i klonen?
-      lastQuizInputs = root.querySelectorAll(
-        'input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"], [role="option"]'
-      ).length;
-
       // Saml svar-rækker i dokument-rækkefølge uden dubletter/indlejrede.
       const rowSet = [];
       const pushRow = (el) => {
@@ -433,8 +428,6 @@
         }
         if (row && (row.textContent || '').trim()) pushRow(row);
       });
-
-      lastQuizRows = rowSet.length;
 
       if (rowSet.length) {
         // Live-rækker til computed-style-fallback (grøn baggrund), matchet på tekst.
@@ -476,10 +469,14 @@
 
         // Erstat hver svar-række PÅ STEDET med et punkt (bevarer placering pr. quiz).
         const quizForms = new Set();
+        const quizGroups = new Set();
         rowSet.forEach((row) => {
           if (!root.contains(row)) return; // klonen er detached → brug contains, ikke isConnected
           const form = row.closest('form, fieldset');
           if (form && root.contains(form)) quizForms.add(form);
+          // Tæl distinkte quizzer: gruppér på nærmeste svar-container.
+          const group = row.closest('form, fieldset, [role="radiogroup"], ul, ol') || row.parentElement;
+          if (group) quizGroups.add(group);
           const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
           if (!text) { row.remove(); return; }
           const correct = isCorrect(row);
@@ -495,6 +492,7 @@
           row.replaceWith(p);
           lastQuizCount++;
         });
+        lastQuizGroups = quizGroups.size;
 
         // Beskyt quiz-<form>/<fieldset> mod at blive slettet helt i step 2.
         quizForms.forEach((f) => {
