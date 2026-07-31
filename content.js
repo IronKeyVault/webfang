@@ -583,6 +583,17 @@
       }
     });
 
+    // 1d) Navigations-links ("Return to …", "Tilbage til …") er aldrig indhold.
+    //     De fjernes på TEKSTEN, ikke på strukturen, fordi de tit har et
+    //     pile-ikon i sig – og oprydningen i step 8 springer alt med billeder
+    //     over, så artiklens egne billeder ikke ryger med.
+    const NAV_TXT =
+      /^(return to|back to|go back|return$|back$|tilbage til|tilbage$|næste|forrige|next (topic|lesson|page|module)|previous (topic|lesson|page|module))/i;
+    root.querySelectorAll('a').forEach((a) => {
+      const t = (a.textContent || '').replace(/\s+/g, ' ').trim();
+      if (t && t.length < 80 && NAV_TXT.test(t)) a.remove();
+    });
+
     // 2) Strukturel navigation/UI der aldrig er selve artiklen.
     //    (header beholdes bevidst – artiklens titel ligger tit deri.)
     root.querySelectorAll(
