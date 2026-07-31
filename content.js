@@ -6,7 +6,7 @@
   // Versioneret vagt. En side der stod åben da udvidelsen blev opdateret, har
   // stadig det GAMLE script kørende; uden versionsnummer ville en ny indsprøjtning
   // blive afvist, og nye funktioner ville lydløst ikke virke.
-  const VERSION = 2;
+  const VERSION = 5;
   if (window.__webfang && window.__webfang.version >= VERSION) return;
   window.__artikelKopierLoaded = true;
 
@@ -378,6 +378,32 @@
   function clean(root, opts = {}) {
     lastQuizCount = 0;
     lastQuizGroups = 0;
+
+    // 0) Klonen er en tro kopi, så vi kan parre hver knude med sin levende
+    //    tvilling ved at gå de to træer igennem side om side – FØR oprydningen
+    //    begynder at fjerne knuder og bryde sammenhængen. Koblingen bruges til
+    //    alt der kun findes i den levende side: .checked (som er en DOM-
+    //    egenskab, ikke en attribut, og derfor ikke følger med cloneNode) og
+    //    beregnede farver (markeringen af et valgt svar).
+    const liveOf = new WeakMap();
+    if (opts.liveRoot) {
+      const pair = (copy, live) => {
+        liveOf.set(copy, live);
+        const a = copy.children, b = live.children;
+        if (a.length !== b.length) return;  // ude af trit → stop denne gren
+        for (let i = 0; i < a.length; i++) pair(a[i], b[i]);
+      };
+      pair(root, opts.liveRoot);
+
+      // Afkrydsninger skrives over som attribut, så de overlever i klonen.
+      root.querySelectorAll('input[type="radio"], input[type="checkbox"]').forEach((c) => {
+        const live = liveOf.get(c);
+        if (!live) return;
+        if (live.checked) c.setAttribute('checked', '');
+        else c.removeAttribute('checked');
+      });
+    }
+
     // 1) Tekniske/ikke-indholds-tags væk.
     root.querySelectorAll(
       'script, style, noscript, iframe, canvas, link, object, embed, template'
@@ -521,6 +547,8 @@
           'input[type=radio],input[type=checkbox],[role=radio],[role=checkbox],[role=option],button,label,li'
         )] : [];
         const findLive = (row) => {
+          const paired = liveOf.get(row);
+          if (paired) return paired;
           const t = (row.textContent || '').replace(/\s+/g, ' ').trim();
           if (!t) return null;
           return liveRows.find((lr) => (lr.textContent || '').replace(/\s+/g, ' ').trim() === t) || null;
@@ -533,8 +561,82 @@
           } catch (_) {}
           return false;
         };
+        // Tegnede radio-knapper/afkrydsningsfelter (ingen <input>, ingen
+        // aria-checked): den valgte markør er FARVET, de øvrige står tomme.
+        // I stedet for at gætte på en bestemt nuance sammenligner vi rækkernes
+        // markør-farve indbyrdes – flertallets farve er "ikke valgt", og en
+        // afviger med en mættet farve er den valgte.
+        const rgb = (c) => {
+          const m = (c || '').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?/);
+          if (!m || (m[4] !== undefined && Number(m[4]) < 0.5)) return null;
+          return [+m[1], +m[2], +m[3]];
+        };
+        const saturated = (c) => {
+          const v = rgb(c);
+          return !!v && Math.max(...v) - Math.min(...v) > 30;  // ikke hvid/grå/sort
+        };
+        // Markørens farve i en række: et lille, kvadratisk/rundt element.
+        const markerColor = (row) => {
+          const live = findLive(row);
+          if (!live || !live.querySelectorAll) return null;
+          let filled = null;
+          for (const el of live.querySelectorAll('*')) {
+            let r;
+            try { r = el.getBoundingClientRect(); } catch (_) { continue; }
+            if (r.width < 8 || r.width > 34 || r.height < 8 || r.height > 34) continue;
+            if (Math.abs(r.width - r.height) > 6) continue;
+            const bg = getComputedStyle(el).backgroundColor;
+            if (saturated(bg)) return bg;          // en fyldt markør vinder altid
+            if (!filled && rgb(bg)) filled = bg;   // ellers husk den tomme markørs farve
+          }
+          return filled;
+        };
+        const colorPicked = new Set();
+        if (opts.liveRoot && rowSet.length >= 2) {
+          const colors = rowSet.map(markerColor);
+          const tally = new Map();
+          colors.forEach((c) => { if (c) tally.set(c, (tally.get(c) || 0) + 1); });
+          // Flertallet = den tomme markør. Ved uafgjort vinder den umættede.
+          let common = null, bestN = 0;
+          for (const [c, n] of tally) {
+            if (n > bestN || (n === bestN && !saturated(c) && saturated(common))) {
+              bestN = n; common = c;
+            }
+          }
+          if (tally.size > 1) {
+            rowSet.forEach((row, i) => {
+              const c = colors[i];
+              if (c && c !== common && saturated(c)) colorPicked.add(row);
+            });
+          }
+        }
+
+        // Rækkens eget afkrydsningsfelt. Det ligger ikke altid inde i rækken:
+        // mønstret "<input class='peer sr-only' id=x> <label for=x>" (Tailwind,
+        // bl.a. Cisco U.) lægger feltet som SØSKENDE til sit label, og selve
+        // markeringen tegnes af et pseudoelement. Derfor også opslag via for/id
+        // og – som sidste udvej – rækkens egen boks (dens <li>/option-element,
+        // ALDRIG en delt forælder, som ville smitte af på hele quizzen).
+        const BOXES = 'input[type="radio"], input[type="checkbox"]';
+        const ownInput = (row) => {
+          if (row.matches && row.matches(BOXES)) return row;
+          const inside = row.querySelector && row.querySelector(BOXES);
+          if (inside) return inside;
+          const id = row.getAttribute && row.getAttribute('for');
+          if (id) {
+            const byId = root.querySelector('#' + esc(id));
+            if (byId && byId.matches(BOXES)) return byId;
+          }
+          const box = row.closest('li, [class*="answer"], [class*="option"], [class*="choice"]');
+          return (box && box !== row) ? box.querySelector(BOXES) : null;
+        };
+
         const isCorrect = (row) => {
-          // Tjek KUN svarets egen boks (dets eget <li>/option-element), IKKE delte
+          if (colorPicked.has(row)) return true;
+          const own = ownInput(row);
+          if (own && own.hasAttribute('checked')) return true;
+
+          // Ellers: svarets egen boks (dets eget <li>/option-element), IKKE delte
           // forældre – ellers "smitter" et valgt svar af på alle svar i samme quiz.
           const box = row.closest(
             'li, [class*="answer-option"], [class*="answer"], [class*="option"], [role="radio"], [role="checkbox"]'
@@ -542,8 +644,6 @@
           const cls = (box.className && box.className.toString()) || '';
           if (/\b(is-)?correct\b|answer-correct|right-answer|border-green|bg-green|bg-lime|bg-emerald/i.test(cls)) return true;
           if (box.getAttribute && box.getAttribute('aria-checked') === 'true') return true;
-          const inp = box.querySelector && box.querySelector('input[type="radio"], input[type="checkbox"]');
-          if (inp && inp.hasAttribute('checked')) return true;
           // Live: grøn baggrund på svarets egen boks (ikke forældre).
           const live = findLive(row);
           const liveBox = live ? (live.closest(
@@ -566,16 +666,26 @@
           const text = rowText(row);
           if (!text) { row.remove(); return; }
           const correct = isCorrect(row);
-          const p = document.createElement('p');
-          p.setAttribute('style', 'margin:2px 0');
+          // Sidder svaret i en rigtig liste, bliver punkttegnet sat af listen
+          // selv – så skal vi ikke også skrive "•", ellers står der "• •" i Word.
+          // Er svaret pakket ind i et <li> der ikke indeholder andet, udskifter
+          // vi hele <li>'et, så vi ikke efterlader et tomt punkt.
+          const li = row.closest('li');
+          const target = (li && root.contains(li) && norm(li.textContent) === norm(row.textContent))
+            ? li : row;
+          const parent = target.parentElement;
+          const inList = parent && (parent.tagName === 'UL' || parent.tagName === 'OL');
+          const p = document.createElement(inList ? 'li' : 'p');
+          if (!inList) p.setAttribute('style', 'margin:2px 0');
+          const label = (inList ? '' : '• ') + (correct ? '✓ ' : '') + text;
           if (correct) {
             const b = document.createElement('b');
-            b.textContent = '• ✓ ' + text;
+            b.textContent = label;
             p.appendChild(b);
           } else {
-            p.textContent = '• ' + text;
+            p.textContent = label;
           }
-          row.replaceWith(p);
+          target.replaceWith(p);
           lastQuizCount++;
         });
         lastQuizGroups = quizGroups.size;
