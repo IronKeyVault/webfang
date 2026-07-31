@@ -26,7 +26,8 @@
       "description": "Optag artikel med Webfang"
     },
     "start-pick-video": {
-      "description": "Optag video med Webfang (tildel selv en tast under chrome://extensions/shortcuts)"
+      "suggested_key": { "default": "Alt+Z" },
+      "description": "Optag video med Webfang"
     }
   },
   "content_scripts": [

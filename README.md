@@ -17,7 +17,7 @@ Tryk **Esc** for at fortryde.
 
 ## Hent video
 
-1. Tryk på udvidelsens ikon → **🎬 Optag video** (eller Ctrl+Shift+V).
+1. Tryk på udvidelsens ikon → **🎬 Optag video** (eller Alt+Z).
 2. Klik på videoen/afspilleren på siden.
 3. Er der flere kilder, vælg i dropdown'en — den største/bedste ligger øverst.
 4. Tryk **⬇ Hent video**. Filen lander i Overførsler.
