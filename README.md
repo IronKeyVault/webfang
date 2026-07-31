@@ -53,20 +53,33 @@ stadig den gamle udgave af udvidelsens script.
 - Bruger afspilleren streaming, er `src` en `blob:`-URL der er ubrugelig uden for
   siden. Derfor lytter baggrunds-workeren med på fanens netværkstrafik og noterer
   de playlister/mediefiler den ser (`webRequest` — kun observerende, intet blokeres).
-- Ved HLS (`.m3u8`) hentes alle segmenter og samles til én fil i et
-  offscreen-dokument (en service worker har hverken DOM eller blob-URL'er).
-  fMP4-segmenter giver en `.mp4`; MPEG-TS-segmenter giver en `.ts` (spiller i VLC).
+- Ved **HLS** (`.m3u8`) og **DASH** (`.mpd`) hentes alle segmenter og samles til
+  én fil i et offscreen-dokument (en service worker har hverken DOM, XML-parser
+  eller blob-URL'er).
+- fMP4-segmenter er allerede MP4 og lægges bare efter hinanden. **MPEG-TS
+  remuxes til MP4** — indholdet pakkes om, så filen spiller alle steder og ikke
+  kun i VLC. Går remuxen galt, gemmes en `.ts` i stedet for ingenting.
 - Almindelig AES-128-transportkryptering dekrypteres undervejs. **DRM-beskyttet
   indhold (Widevine/FairPlay/SAMPLE-AES) afvises med en klar fejl** — det bryder
   Webfang ikke.
+- Har en DASH-stream lyden liggende adskilt fra videoen, bliver det to filer
+  (`… (video).mp4` og `… (lyd).m4a`), og statuslinjen siger det. At blande dem
+  til én fil kræver en rigtig muxer, og den har Webfang ikke.
 
-## Kendte begrænsninger (v1)
+## Tredjepartskode
+
+`vendor/mux-mp4.min.js` er [mux.js](https://github.com/videojs/mux.js) 6.3.0 fra
+Video.js-projektet, brugt til at remuxe MPEG-TS til MP4. Apache License 2.0 —
+licensteksten ligger i `vendor/mux.js-LICENSE.txt`. Resten af Webfang er egen kode.
+
+## Kendte begrænsninger
 
 - CSS-`background-image` kopieres ikke — kun rigtige `<img>`-elementer.
 - Billeder over 12 MB springes over (for at holde clipboard håndterbar).
 - Virker ikke på `chrome://`-sider eller Web Store-sider (browser-spærret).
 - Layout er "godt nok", ikke pixel-perfekt — det er redigerbar tekst + billeder,
   ikke et screenshot.
-- DASH-streams (`.mpd`) understøttes ikke — kun direkte filer og HLS.
-- Ved HLS vælges automatisk den højeste bitrate; man kan ikke vælge kvalitet.
-- Live-streams hentes som de ser ud i playlisten lige nu (ingen "optag videre").
+- Der vælges automatisk den højeste bitrate; man kan ikke vælge kvalitet selv.
+- Live-streams understøttes ikke (`type="dynamic"` i DASH afvises).
+- Hele videoen holdes i hukommelsen mens den samles, så meget lange film kan
+  blive tunge.

@@ -1,23 +1,26 @@
-// Offscreen-dokument: henter en HLS-playliste, samler dens segmenter til én
-// fil og giver baggrunds-workeren en blob-URL den kan downloade.
+// Offscreen-dokument: henter en HLS- eller DASH-stream, samler dens segmenter
+// til én fil og giver baggrunds-workeren en blob-URL den kan downloade.
 //
-// Bemærk: kun almindelig HLS. Er streamen DRM-beskyttet (Widevine/FairPlay/
-// SAMPLE-AES) stopper vi med en klar fejl – Webfang bryder ikke DRM.
+// Bemærk: kun ubeskyttede streams. Er streamen DRM-beskyttet (Widevine/
+// FairPlay/SAMPLE-AES) stopper vi med en klar fejl – Webfang bryder ikke DRM.
 
 const CONCURRENCY = 5;
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg) return;
 
-  if (msg.type === 'OFFSCREEN_HLS') {
-    buildHls(msg.url, msg.tabId)
+  if (msg.type === 'OFFSCREEN_HLS' || msg.type === 'OFFSCREEN_DASH') {
+    const build = msg.type === 'OFFSCREEN_HLS' ? buildHls : buildDash;
+    build(msg.url, msg.tabId)
       .then(sendResponse)
       .catch((e) => sendResponse({ ok: false, error: e.message || String(e) }));
     return true;
   }
 
   if (msg.type === 'OFFSCREEN_REVOKE') {
-    try { URL.revokeObjectURL(msg.blobUrl); } catch (_) {}
+    (msg.blobUrls || []).forEach((u) => {
+      try { URL.revokeObjectURL(u); } catch (_) {}
+    });
     return;
   }
 });
@@ -31,6 +34,17 @@ async function fetchText(url) {
   if (!res.ok) throw new Error(`HTTP ${res.status} på playlisten`);
   return res.text();
 }
+
+// Tæller fremdrift på tværs af alle segmenter i en download.
+function makeTicker(tabId, total) {
+  let done = 0;
+  return () => {
+    done++;
+    if (done % 5 === 0 || done === total) progress(tabId, `Henter video… ${done}/${total}`);
+  };
+}
+
+// ---- HLS ------------------------------------------------------------------
 
 async function buildHls(url, tabId) {
   let text = await fetchText(url);
@@ -50,15 +64,7 @@ async function buildHls(url, tabId) {
   const pl = parseMedia(text, playlistUrl);
   if (!pl.segments.length) throw new Error('Playlisten indeholder ingen segmenter');
 
-  const total = pl.segments.length + (pl.map ? 1 : 0);
-  let done = 0;
-  const tick = () => {
-    done++;
-    if (done % 5 === 0 || done === total) {
-      progress(tabId, `Henter video… ${done}/${total}`);
-    }
-  };
-
+  const tick = makeTicker(tabId, pl.segments.length + (pl.map ? 1 : 0));
   const parts = new Array(pl.segments.length);
   const keyCache = new Map();
 
@@ -68,25 +74,115 @@ async function buildHls(url, tabId) {
     tick();
   });
 
-  const blobParts = [];
   if (pl.map) {
+    // fMP4: init-segmentet forrest, så er filen en færdig .mp4.
     const initBuf = await fetchRange(pl.map.url, pl.map.byterange);
-    blobParts.push(new Uint8Array(initBuf));
     tick();
+    return { ok: true, files: [makeFile([new Uint8Array(initBuf), ...parts], 'mp4')] };
   }
-  blobParts.push(...parts);
 
-  // fMP4-segmenter (med init-segment) giver en rigtig .mp4; ellers er det
-  // MPEG-TS, som beholder .ts – den spiller i VLC og de fleste afspillere.
-  const ext = pl.map ? 'mp4' : 'ts';
-  const type = pl.map ? 'video/mp4' : 'video/mp2t';
-
-  progress(tabId, 'Samler filen…');
-  const blob = new Blob(blobParts, { type });
-  return { ok: true, blobUrl: URL.createObjectURL(blob), size: blob.size, ext };
+  // MPEG-TS: skal remuxes for at blive en .mp4 (se remuxTs).
+  return { ok: true, files: [await tsToMp4(parts, tabId)] };
 }
 
-// ---- Playliste-parsing ----------------------------------------------------
+// ---- DASH -----------------------------------------------------------------
+
+async function buildDash(url, tabId) {
+  progress(tabId, 'Læser .mpd-filen…');
+  const { streams } = parseMpd(await fetchText(url), url);
+
+  const total = streams.reduce((n, s) => n + s.segments.length + (s.init ? 1 : 0), 0);
+  const tick = makeTicker(tabId, total);
+  const files = [];
+
+  for (const s of streams) {
+    // Ligger hele streamen i én fil, henter vi den bare som den er.
+    if (s.single) {
+      const buf = await fetchRange(s.segments[0].url, s.segments[0].byterange);
+      tick();
+      files.push(makeFile([new Uint8Array(buf)], 'mp4', suffixFor(streams, s)));
+      continue;
+    }
+
+    const parts = new Array(s.segments.length);
+    await pool(s.segments, CONCURRENCY, async (seg, i) => {
+      const buf = await fetchRange(seg.url, seg.byterange);
+      parts[i] = new Uint8Array(buf);
+      tick();
+    });
+
+    const blobParts = [];
+    if (s.init) {
+      const initBuf = await fetchRange(s.init.url, s.init.byterange);
+      tick();
+      blobParts.push(new Uint8Array(initBuf));
+    }
+    blobParts.push(...parts);
+
+    // DASH-segmenter er fMP4; lyd alene gemmes som .m4a.
+    const ext = s.kind === 'audio' && streams.length > 1 ? 'm4a' : 'mp4';
+    files.push(makeFile(blobParts, ext, suffixFor(streams, s)));
+  }
+
+  return {
+    ok: true,
+    files,
+    // Er lyden en separat fil, skal brugeren have det at vide.
+    note: files.length > 1 ? 'video og lyd kom som to filer' : ''
+  };
+}
+
+// Navne-tilføjelse når en stream bliver til flere filer.
+function suffixFor(streams, s) {
+  if (streams.length < 2) return '';
+  return s.kind === 'audio' ? ' (lyd)' : ' (video)';
+}
+
+// ---- TS → MP4 -------------------------------------------------------------
+
+// MPEG-TS kan ikke bare omdøbes til .mp4 – indholdet skal pakkes om. mux.js
+// demuxer H.264/AAC ud af TS-strømmen og skriver den som fragmenteret MP4.
+async function tsToMp4(parts, tabId) {
+  progress(tabId, 'Konverterer til MP4…');
+  try {
+    const out = await remuxTs(parts);
+    if (!out.length) throw new Error('tom uddata');
+    return makeFile(out, 'mp4');
+  } catch (e) {
+    // Hellere en .ts der kan afspilles i VLC end ingen fil.
+    progress(tabId, 'Kunne ikke konvertere – gemmer som .ts');
+    return makeFile(parts, 'ts');
+  }
+}
+
+function remuxTs(parts) {
+  return new Promise((resolve, reject) => {
+    const tm = new muxjs.mp4.Transmuxer({ remux: true });
+    const out = [];
+    let haveInit = false;
+    tm.on('data', (seg) => {
+      if (!haveInit && seg.initSegment) { out.push(seg.initSegment); haveInit = true; }
+      out.push(seg.data);
+    });
+    tm.on('error', (e) => reject(new Error(e && e.message || 'remux fejlede')));
+    try {
+      parts.forEach((p) => tm.push(p));
+      tm.flush();
+      resolve(out);
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+function makeFile(parts, ext, suffix = '') {
+  const type = ext === 'mp4' ? 'video/mp4'
+    : ext === 'm4a' ? 'audio/mp4' : 'video/mp2t';
+  const blob = new Blob(parts, { type });
+  return { blobUrl: URL.createObjectURL(blob), size: blob.size, ext, suffix };
+}
+
+// ---- HLS-playliste-parsing ------------------------------------------------
 
 function parseMaster(text, base) {
   const out = [];

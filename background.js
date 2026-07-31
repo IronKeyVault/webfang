@@ -211,24 +211,33 @@ async function downloadMedia(msg, tabId) {
   const { url, kind, filename } = msg;
   if (!url) throw new Error('Ingen video-URL');
 
-  if (kind === 'dash') {
-    throw new Error('DASH-streams (.mpd) understøttes ikke endnu');
-  }
-
-  if (kind === 'hls') {
+  if (kind === 'hls' || kind === 'dash') {
     relay(tabId, { type: 'MEDIA_PROGRESS', text: 'Læser playliste…' });
-    const res = await runInOffscreen({ type: 'OFFSCREEN_HLS', url, tabId });
+    const res = await runInOffscreen({
+      type: kind === 'hls' ? 'OFFSCREEN_HLS' : 'OFFSCREEN_DASH', url, tabId
+    });
     if (!res || !res.ok) throw new Error((res && res.error) || 'Kunne ikke samle videoen');
-    const id = await chrome.downloads.download({
-      url: res.blobUrl,
-      filename: safeName(filename, res.ext || 'mp4'),
-      saveAs: false
+
+    // En DASH-stream med adskilt lyd giver to filer.
+    const ids = [];
+    for (const f of res.files) {
+      ids.push(await chrome.downloads.download({
+        url: f.blobUrl,
+        filename: safeName(filename + (f.suffix || ''), f.ext || 'mp4'),
+        saveAs: false
+      }));
+    }
+    // Frigiv blob'erne igen når filerne er skrevet.
+    Promise.all(ids.map(whenDone)).finally(() => {
+      chrome.runtime.sendMessage({
+        type: 'OFFSCREEN_REVOKE', blobUrls: res.files.map((f) => f.blobUrl)
+      }).catch(() => {});
     });
-    // Frigiv blob'en igen når filen er skrevet.
-    whenDone(id).finally(() => {
-      chrome.runtime.sendMessage({ type: 'OFFSCREEN_REVOKE', blobUrl: res.blobUrl }).catch(() => {});
-    });
-    return { ok: true, size: res.size };
+    return {
+      ok: true,
+      size: res.files.reduce((n, f) => n + f.size, 0),
+      note: res.note || ''
+    };
   }
 
   // Direkte fil: lad browseren om det – den sender sidens cookies med.
