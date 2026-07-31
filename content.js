@@ -3,7 +3,11 @@
 // inline billederne som data-URI'er, og kopiér som rich HTML til udklipsholderen.
 
 (() => {
-  if (window.__artikelKopierLoaded) return;
+  // Versioneret vagt. En side der stod åben da udvidelsen blev opdateret, har
+  // stadig det GAMLE script kørende; uden versionsnummer ville en ny indsprøjtning
+  // blive afvist, og nye funktioner ville lydløst ikke virke.
+  const VERSION = 2;
+  if (window.__webfang && window.__webfang.version >= VERSION) return;
   window.__artikelKopierLoaded = true;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -119,11 +123,15 @@
 
   function onKey(e) {
     if (phase === 'idle') return;
-    if (e.key === 'Escape') { e.preventDefault(); teardown(); }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      if (phase === 'vhover' || phase === 'vselected') videoTeardown();
+      else teardown();
+    }
   }
 
   function onScrollResize() {
-    if (phase === 'selected') positionOverlay(currentEl);
+    if (phase === 'selected' || phase === 'vselected') positionOverlay(currentEl);
   }
 
   // ---- Element-valg -------------------------------------------------------
@@ -232,8 +240,19 @@
       try {
         map = await chrome.runtime.sendMessage({ type: 'INLINE_IMAGES', urls }) || {};
       } catch (_) { map = {}; }
+
+      // Andet forsøg for dem workeren ikke kunne hente: prøv fra selve siden.
+      // Nogle CDN'er (fx Cisco's e-learning) kræver sidens cookies OG referer,
+      // og dem har kun sidens egen kontekst. Et billede der ikke bliver
+      // indlejret, ender som et LINKET billede i Word – det peger tilbage på
+      // nettet og overskygger et hyperlink man selv sætter på billedet.
+      const missing = urls.filter((u) => !map[u]);
+      if (missing.length) {
+        Object.assign(map, await inlineInPage(missing));
+      }
     }
     applyImages(clone, map);
+    const embedded = urls.filter((u) => map[u]).length;
 
     // 4) Byg endeligt output og cache et ClipboardItem (så selve kopieringen
     //    kan ske synkront inde i knap-klikket = gyldig user activation).
@@ -244,7 +263,30 @@
       'text/plain': new Blob([text], { type: 'text/plain' })
     });
     prepared = { item, html, text };
-    setReady(urls.length);
+    setReady(urls.length, embedded);
+  }
+
+  // Hent billeder fra sidens egen kontekst (cookies + referer følger med) og
+  // omdan til data-URI. Bruges kun for dem baggrunds-workeren ikke kunne få.
+  async function inlineInPage(urls) {
+    const out = {};
+    await Promise.all(urls.map(async (url) => {
+      try {
+        const res = await fetch(url, { credentials: 'include' });
+        if (!res.ok) return;
+        const blob = await res.blob();
+        if (blob.size > 12 * 1024 * 1024) return; // samme grænse som workeren
+        out[url] = await new Promise((resolve, reject) => {
+          const fr = new FileReader();
+          fr.onload = () => resolve(fr.result);
+          fr.onerror = reject;
+          fr.readAsDataURL(blob);
+        });
+      } catch (_) {
+        // Blokeret af CORS → billedet beholder sin original-URL.
+      }
+    }));
+    return out;
   }
 
   function setBusy(msg) {
@@ -253,10 +295,17 @@
     btnCopy.style.opacity = '0.5';
     btnCopy.style.cursor = 'default';
   }
-  function setReady(imgCount) {
+  function setReady(imgCount, embedded) {
     const quiz = lastQuizGroups
       ? `, ${lastQuizGroups} quiz (${lastQuizCount} svar)` : '';
-    status.textContent = `Klar (${imgCount} billeder${quiz})`;
+    // Vis det hvis nogle billeder ikke kunne indlejres: de bliver til linkede
+    // billeder i Word (peger tilbage på nettet) i stedet for rigtigt indhold.
+    const miss = imgCount - embedded;
+    const img = miss > 0
+      ? `${embedded}/${imgCount} billeder – ${miss} kunne ikke indlejres`
+      : `${imgCount} billeder`;
+    status.textContent = `Klar (${img}${quiz})`;
+    status.style.color = miss > 0 ? '#fca5a5' : '';
     btnCopy.disabled = false;
     btnCopy.style.opacity = '1';
     btnCopy.style.cursor = 'pointer';
@@ -540,9 +589,21 @@
       }
     });
 
-    // 5) Valgfrit: fjern links helt (behold kun teksten).
+    // 4b) Pak billeder ud af deres link. Et <a><img></a> bliver i Word til et
+    //     billede med hyperlink til den originale side/fil, og det skygger for
+    //     et hyperlink man selv sætter på billedet bagefter. Kun links uden
+    //     egentlig tekst pakkes ud, så "læs mere"-links med ikon beholdes.
+    root.querySelectorAll('a').forEach((a) => {
+      if (!a.querySelector('img')) return;
+      if ((a.textContent || '').trim().length > 3) return;
+      a.replaceWith(...a.childNodes);
+    });
+
+    // 5) Valgfrit: fjern links helt (behold kun teksten – og billederne, som
+    //    ellers ville forsvinde sammen med linket).
     if (opts.stripLinks) {
       root.querySelectorAll('a').forEach((a) => {
+        if (a.querySelector('img')) { a.replaceWith(...a.childNodes); return; }
         a.replaceWith(document.createTextNode(a.textContent || ''));
       });
     }
@@ -695,7 +756,227 @@
     unmount();
   }
 
+  // ---- Video-optag --------------------------------------------------------
+  //
+  // Samme peg-og-klik som artiklen, men målet er en video. Kilden findes i to
+  // trin: først afspillerens egen src, og hvis den er en blob: (streaming, hvor
+  // src'en er ubrugelig uden for siden) spørger vi baggrunds-workeren hvilke
+  // medie-URL'er den har set fanen hente.
+
+  const VIDEO_SEL = 'video, .video-js, [data-vjs-player], [class*="videoplayer"], ' +
+    '[class*="video-player"], [class*="videoPlayer"], [class*="player"]';
+
+  let vidCands = [];   // [{url, kind, size, label}]
+
+  const vToolbar = document.createElement('div');
+  Object.assign(vToolbar.style, {
+    position: 'fixed', zIndex: 2147483647, left: '50%', bottom: '24px',
+    transform: 'translateX(-50%)', display: 'none', gap: '8px',
+    alignItems: 'center', padding: '10px 14px', borderRadius: '12px',
+    background: '#111827', color: '#fff', boxShadow: '0 8px 30px rgba(0,0,0,0.35)',
+    font: '13px system-ui, sans-serif'
+  });
+
+  const vStatus = document.createElement('span');
+  vStatus.style.marginRight = '4px';
+
+  const vSelect = document.createElement('select');
+  Object.assign(vSelect.style, {
+    padding: '6px 8px', borderRadius: '8px', border: 'none',
+    font: '13px system-ui, sans-serif', maxWidth: '320px', display: 'none'
+  });
+
+  const btnGet = mkBtn('⬇ Hent video');
+  btnGet.style.background = '#2563eb';
+  const btnVCancel = mkBtn('✕');
+  vToolbar.append(vStatus, vSelect, btnGet, btnVCancel);
+
+  const isOurVideoUI = (el) =>
+    overlay.contains(el) || vToolbar.contains(el) || el === overlay || el === vToolbar;
+
+  function videoTarget(el) {
+    if (!el || !el.closest) return null;
+    const hit = el.closest(VIDEO_SEL);
+    if (hit) return hit;
+    // Klikket lige ved siden af? Tag containeren hvis den rummer en afspiller.
+    return el.querySelector && el.querySelector('video, .video-js') ? el : null;
+  }
+
+  function onVideoMove(e) {
+    if (phase !== 'vhover') return;
+    if (isOurVideoUI(e.target)) return;
+    positionOverlay(videoTarget(e.target) || e.target);
+  }
+
+  function onVideoClick(e) {
+    if (phase !== 'vhover') return;
+    if (isOurVideoUI(e.target)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    selectVideo(videoTarget(e.target) || e.target);
+  }
+
+  // Afspillerens egne kilder (springer blob:/data: over – de kan ikke hentes).
+  function localSources(container) {
+    const out = [];
+    const push = (u) => {
+      if (!u || u.startsWith('blob:') || u.startsWith('data:')) return;
+      try { out.push(new URL(u, location.href).href); } catch (_) {}
+    };
+    const videos = container.matches && container.matches('video')
+      ? [container] : [...container.querySelectorAll('video')];
+    videos.forEach((v) => {
+      push(v.currentSrc);
+      push(v.getAttribute('src'));
+      v.querySelectorAll('source').forEach((s) => push(s.getAttribute('src')));
+    });
+    // Nogle afspillere gemmer kilden i et data-attribut på wrapperen.
+    if (container.attributes) {
+      [...container.attributes].forEach((a) => {
+        const m = (a.value || '').match(/https?:\/\/[^\s"']+\.(m3u8|mp4|webm)(\?[^\s"']*)?/i);
+        if (m) push(m[0]);
+      });
+    }
+    return [...new Set(out)];
+  }
+
+  const fmtSize = (n) => !n ? '' :
+    n > 1048576 ? ` (${Math.round(n / 1048576)} MB)` : ` (${Math.round(n / 1024)} kB)`;
+
+  function labelFor(c) {
+    let name = c.url;
+    try { name = new URL(c.url).pathname.split('/').pop() || c.url; } catch (_) {}
+    const kind = c.kind === 'hls' ? 'stream' : c.kind === 'dash' ? 'DASH' : 'fil';
+    return `${name.slice(0, 48)} – ${kind}${fmtSize(c.size)}`;
+  }
+
+  async function selectVideo(container) {
+    phase = 'vselected';
+    currentEl = container;
+    positionOverlay(container);
+    vToolbar.style.display = 'flex';
+    setVBusy('Leder efter video-kilden…');
+
+    const seen = new Set();
+    const cands = [];
+    const add = (c) => {
+      if (!c.url || seen.has(c.url)) return;
+      seen.add(c.url);
+      cands.push(c);
+    };
+
+    localSources(container).forEach((u) => {
+      add({ url: u, kind: /\.m3u8(\?|$)/i.test(u) ? 'hls' : 'file', size: 0 });
+    });
+
+    // Kilder som baggrunds-workeren har set fanen hente (fanger blob:-afspillere).
+    let sniffed = [];
+    try {
+      sniffed = await chrome.runtime.sendMessage({ type: 'GET_MEDIA' }) || [];
+    } catch (_) {}
+    sniffed
+      .sort((a, b) => (b.size - a.size) || (b.ts - a.ts))
+      .forEach(add);
+
+    vidCands = cands;
+
+    if (!cands.length) {
+      vSelect.style.display = 'none';
+      vStatus.textContent = 'Ingen video fundet – start afspilningen og prøv igen';
+      btnGet.disabled = true;
+      btnGet.style.opacity = '0.5';
+      return;
+    }
+
+    vSelect.innerHTML = '';
+    cands.forEach((c, i) => {
+      const o = document.createElement('option');
+      o.value = String(i);
+      o.textContent = labelFor(c);
+      vSelect.appendChild(o);
+    });
+    vSelect.style.display = cands.length > 1 ? 'block' : 'none';
+    vStatus.textContent = cands.length > 1
+      ? `${cands.length} kilder fundet:` : 'Kilde fundet:';
+    btnGet.disabled = false;
+    btnGet.style.opacity = '1';
+  }
+
+  function setVBusy(msg) {
+    vStatus.textContent = msg;
+    btnGet.disabled = true;
+    btnGet.style.opacity = '0.5';
+  }
+
+  btnGet.onclick = async () => {
+    const c = vidCands[Number(vSelect.value) || 0];
+    if (!c) return;
+    setVBusy('Henter…');
+    vSelect.style.display = 'none';
+    try {
+      const res = await chrome.runtime.sendMessage({
+        type: 'DOWNLOAD_MEDIA',
+        url: c.url,
+        kind: c.kind,
+        filename: (document.title || 'video').trim()
+      });
+      if (res && res.ok) {
+        toast('Video hentet ✓ – ligger i Overførsler', 3500);
+        videoTeardown();
+      } else {
+        vStatus.textContent = 'Fejl: ' + ((res && res.error) || 'ukendt');
+        btnGet.disabled = false;
+        btnGet.style.opacity = '1';
+      }
+    } catch (e) {
+      vStatus.textContent = 'Fejl: ' + (e.message || e);
+      btnGet.disabled = false;
+      btnGet.style.opacity = '1';
+    }
+  };
+
+  btnVCancel.onclick = () => videoTeardown();
+
+  function startPickVideo() {
+    if (phase !== 'idle') return;
+    phase = 'vhover';
+    vidCands = [];
+    document.documentElement.append(overlay, vToolbar);
+    vToolbar.style.display = 'none';
+    document.addEventListener('mousemove', onVideoMove, true);
+    document.addEventListener('click', onVideoClick, true);
+    document.addEventListener('keydown', onKey, true);
+    window.addEventListener('scroll', onScrollResize, true);
+    window.addEventListener('resize', onScrollResize, true);
+    toast('Klik på videoen du vil hente (Esc = fortryd)', 3500);
+  }
+
+  function videoTeardown() {
+    phase = 'idle';
+    currentEl = null;
+    vidCands = [];
+    document.removeEventListener('mousemove', onVideoMove, true);
+    document.removeEventListener('click', onVideoClick, true);
+    document.removeEventListener('keydown', onKey, true);
+    window.removeEventListener('scroll', onScrollResize, true);
+    window.removeEventListener('resize', onScrollResize, true);
+    overlay.remove();
+    vToolbar.remove();
+  }
+
+  // Optag startes ved at kalde denne direkte (chrome.scripting), IKKE via en
+  // besked. En besked ville også ramme et gammelt content-script på en side der
+  // stod åben under opdateringen, og starte optaget to gange.
+  window.__webfang = {
+    version: VERSION,
+    start: (what) => { what === 'video' ? startPickVideo() : startPick(); }
+  };
+
   chrome.runtime.onMessage.addListener((msg) => {
-    if (msg && msg.type === 'START_PICK') startPick();
+    if (!msg) return;
+    // Fremdrift undervejs i en stream-download.
+    if (msg.type === 'MEDIA_PROGRESS' && phase === 'vselected') {
+      vStatus.textContent = msg.text;
+    }
   });
 })();

@@ -1,9 +1,17 @@
 {
   "manifest_version": 3,
   "name": "Webfang",
-  "version": "1.0.0",
-  "description": "Optag en artikel fra en webside inkl. billeder og kopiér til udklipsholder som rich HTML.",
-  "permissions": ["activeTab", "scripting", "clipboardWrite"],
+  "version": "1.1.0",
+  "description": "Optag en artikel fra en webside inkl. billeder og kopiér til udklipsholder som rich HTML – eller hent sidens video ned som fil.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "clipboardWrite",
+    "downloads",
+    "webRequest",
+    "storage",
+    "offscreen"
+  ],
   "host_permissions": ["<all_urls>"],
   "action": {
     "default_popup": "popup.html",
@@ -16,6 +24,9 @@
     "start-pick": {
       "suggested_key": { "default": "Ctrl+Shift+Z" },
       "description": "Optag artikel med Webfang"
+    },
+    "start-pick-video": {
+      "description": "Optag video med Webfang (tildel selv en tast under chrome://extensions/shortcuts)"
     }
   },
   "content_scripts": [
