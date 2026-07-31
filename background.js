@@ -207,9 +207,48 @@ function relay(tabId, msg) {
   chrome.tabs.sendMessage(tabId, msg).catch(() => {});
 }
 
+// Fortløbende nummer foran filnavnet. Ligger i storage.local, så tælleren
+// overlever både browseren og en genstart af service workeren – brugeren kan
+// fortsætte hvor hen slap. Nummeret bruges først, tælles op når downloaden er
+// sat i gang, så en fejlet hentning ikke brænder et nummer.
+const SEQ_KEY = 'videoSeq';        // næste nummer der bruges
+const SEQ_ON_KEY = 'videoSeqOn';   // slået til/fra
+
+async function seqState() {
+  const st = await chrome.storage.local.get([SEQ_KEY, SEQ_ON_KEY]);
+  const n = Number(st[SEQ_KEY]);
+  return {
+    on: st[SEQ_ON_KEY] !== false,
+    next: Number.isFinite(n) && n > 0 ? Math.floor(n) : 1
+  };
+}
+
+function seqPrefix(n) {
+  return n + ' - ';
+}
+
+// Hvor filerne lander styres af browserens egen downloadmappe
+// (chrome://settings/downloads) – en udvidelse må alligevel kun skrive under
+// den. Eneste knap her er "spørg hvor": browserens gem-dialog, hvor man kan
+// browse frit, og som selv husker sidste mappe.
+const ASK_KEY = 'videoAsk';
+
+async function askState() {
+  const st = await chrome.storage.local.get(ASK_KEY);
+  return { ask: st[ASK_KEY] === true };
+}
+
 async function downloadMedia(msg, tabId) {
-  const { url, kind, filename } = msg;
+  const { url, kind } = msg;
   if (!url) throw new Error('Ingen video-URL');
+
+  const seq = await seqState();
+  const { ask } = await askState();
+  const filename = seq.on ? seqPrefix(seq.next) + (msg.filename || 'video')
+                          : msg.filename;
+  const bumpSeq = () => seq.on
+    ? chrome.storage.local.set({ [SEQ_KEY]: seq.next + 1 }).catch(() => {})
+    : Promise.resolve();
 
   if (kind === 'hls' || kind === 'dash') {
     relay(tabId, { type: 'MEDIA_PROGRESS', text: 'Læser playliste…' });
@@ -224,7 +263,7 @@ async function downloadMedia(msg, tabId) {
       ids.push(await chrome.downloads.download({
         url: f.blobUrl,
         filename: safeName(filename + (f.suffix || ''), f.ext || 'mp4'),
-        saveAs: false
+        saveAs: ask
       }));
     }
     // Frigiv blob'erne igen når filerne er skrevet.
@@ -233,10 +272,12 @@ async function downloadMedia(msg, tabId) {
         type: 'OFFSCREEN_REVOKE', blobUrls: res.files.map((f) => f.blobUrl)
       }).catch(() => {});
     });
+    await bumpSeq();
     return {
       ok: true,
       size: res.files.reduce((n, f) => n + f.size, 0),
-      note: res.note || ''
+      note: res.note || '',
+      seq: seq.on ? seq.next : null
     };
   }
 
@@ -244,9 +285,10 @@ async function downloadMedia(msg, tabId) {
   await chrome.downloads.download({
     url,
     filename: safeName(filename, extFromUrl(url)),
-    saveAs: false
+    saveAs: ask
   });
-  return { ok: true };
+  await bumpSeq();
+  return { ok: true, seq: seq.on ? seq.next : null };
 }
 
 function whenDone(id) {

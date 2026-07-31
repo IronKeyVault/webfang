@@ -53,3 +53,58 @@ document.getElementById('start')
   .addEventListener('click', () => startPick('artikel'));
 document.getElementById('startVideo')
   .addEventListener('click', () => startPick('video'));
+
+// ------------------------------------------------------ fortløbende nummer ---
+//
+// Tælleren ligger i storage.local (ikke .session), så den fortsætter hvor den
+// slap næste gang browseren åbnes. Baggrunds-workeren tæller op efter hver
+// hentning; her kan nummeret sættes manuelt, fx når man skifter serie.
+
+const SEQ_KEY = 'videoSeq';
+const SEQ_ON_KEY = 'videoSeqOn';
+
+const seqOn = document.getElementById('seqOn');
+const seqNext = document.getElementById('seqNext');
+const seqSaved = document.getElementById('seqSaved');
+let savedTimer = null;
+
+function flashSaved() {
+  seqSaved.style.visibility = 'visible';
+  clearTimeout(savedTimer);
+  savedTimer = setTimeout(() => { seqSaved.style.visibility = 'hidden'; }, 1200);
+}
+
+chrome.storage.local.get([SEQ_KEY, SEQ_ON_KEY]).then((st) => {
+  const n = Number(st[SEQ_KEY]);
+  seqNext.value = Number.isFinite(n) && n > 0 ? Math.floor(n) : 1;
+  seqOn.checked = st[SEQ_ON_KEY] !== false;
+  seqNext.disabled = !seqOn.checked;
+});
+
+seqOn.addEventListener('change', () => {
+  seqNext.disabled = !seqOn.checked;
+  chrome.storage.local.set({ [SEQ_ON_KEY]: seqOn.checked }).then(flashSaved);
+});
+
+// Gem mens der tastes – popup'en kan lukke når som helst.
+seqNext.addEventListener('input', () => {
+  const n = Math.floor(Number(seqNext.value));
+  if (!Number.isFinite(n) || n < 1) return;
+  chrome.storage.local.set({ [SEQ_KEY]: n }).then(flashSaved);
+});
+
+// ------------------------------------------------------------- gem-dialog ---
+//
+// Hvor filerne lander styres i browserens egne indstillinger; en udvidelse må
+// alligevel kun skrive under downloadmappen. Her er kun til/fra for gem-
+// dialogen, til dem der vil et andet sted hen i ny og næ.
+
+const ASK_KEY = 'videoAsk';
+const ask = document.getElementById('ask');
+
+chrome.storage.local.get(ASK_KEY).then((st) => { ask.checked = st[ASK_KEY] === true; });
+chrome.storage.local.remove('videoDir').catch(() => {});  // ryd op efter tidligere mappe-felt
+
+ask.addEventListener('change', () => {
+  chrome.storage.local.set({ [ASK_KEY]: ask.checked }).then(flashSaved);
+});

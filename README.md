@@ -25,6 +25,24 @@ Tryk **Esc** for at fortryde.
 Finder den ingenting, så start afspilningen et par sekunder og prøv igen —
 streaming-afspillere afslører først deres rigtige URL når de begynder at hente.
 
+### Fortløbende nummer
+
+Filerne får sidens egen titel som navn med et løbenummer foran, fx
+`57 - Sådan gør du.mp4`. Nummeret sættes i popup'en under **Næste nr** og
+tælles op med 1 for hver hentet video. Det gemmes i browseren, så tælleren
+fortsætter hvor den slap næste gang — også efter en genstart. Sæt det til det
+tal du er nået til (fx 57), eller slå **Nummerér videoer** fra hvis navnet skal
+stå rent. En hentning der fejler bruger ikke et nummer.
+
+### Hvor filerne lander
+
+I browserens downloadmappe — den sættes under `chrome://settings/downloads`, og
+en udvidelse må alligevel ikke skrive andre steder hen.
+
+Skal en enkelt video et andet sted hen, så sæt flueben i **Spørg hvor filen skal
+gemmes** i popup'en. Så åbner browserens egen gem-dialog, hvor du kan browse frit;
+den husker selv sidste placering.
+
 ## Sådan installeres den (uden Web Store)
 
 1. Åbn `chrome://extensions` (eller `edge://extensions`).

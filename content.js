@@ -960,9 +960,10 @@
       if (res && res.ok) {
         // DASH kan levere video og lyd som to separate filer – sig det, i
         // stedet for at lade brugeren opdage en tavs video bagefter.
+        const nr = res.seq ? ` (nr. ${res.seq})` : '';
         toast(res.note
-          ? `Hentet ✓ – ${res.note}, ligger i Overførsler`
-          : 'Video hentet ✓ – ligger i Overførsler', res.note ? 6000 : 3500);
+          ? `Hentet ✓${nr} – ${res.note}, ligger i Overførsler`
+          : `Video hentet ✓${nr} – ligger i Overførsler`, res.note ? 6000 : 3500);
         videoTeardown();
       } else {
         vStatus.textContent = 'Fejl: ' + ((res && res.error) || 'ukendt');
