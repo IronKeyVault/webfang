@@ -443,6 +443,27 @@
     {
       const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : s);
 
+      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+
+      // Tekst fra knapper der betjener quizzen ("Remove Match", ✕) er ikke en
+      // del af svaret og skal ikke med i optaget.
+      const CONTROL_TXT =
+        /^(remove match|remove|clear|reset|fjern match|fjern|slet|nulstil|drag|træk|[×✕✖x])$/i;
+
+      // Svarets tekst. To ting ud over oprydningen: knap-tekster fjernes, og
+      // match-øvelser (venstre kolonne parret med højre) skrives som
+      // "spørgsmål → svar", så sammenhængen overlever i Word – ellers bliver
+      // parret til én løbende sætning man ikke kan læse.
+      const rowText = (row) => {
+        const c = row.cloneNode(true);
+        c.querySelectorAll('*').forEach((n) => {
+          if (n.children.length === 0 && CONTROL_TXT.test(norm(n.textContent))) n.remove();
+        });
+        const blocks = [...c.children].map((x) => norm(x.textContent)).filter(Boolean);
+        if (blocks.length === 2) return blocks[0] + ' → ' + blocks[1];
+        return norm(c.textContent);
+      };
+
       // Saml svar-rækker i dokument-rækkefølge uden dubletter/indlejrede.
       const rowSet = [];
       const pushRow = (el) => {
@@ -526,7 +547,7 @@
           // Tæl distinkte quizzer: gruppér på nærmeste svar-container.
           const group = row.closest('form, fieldset, [role="radiogroup"], ul, ol') || row.parentElement;
           if (group) quizGroups.add(group);
-          const text = (row.textContent || '').replace(/\s+/g, ' ').trim();
+          const text = rowText(row);
           if (!text) { row.remove(); return; }
           const correct = isCorrect(row);
           const p = document.createElement('p');
