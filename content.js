@@ -436,6 +436,20 @@
     root.querySelectorAll('[class*="vjs-"], [class*="transcript"]')
       .forEach((n) => n.remove());
 
+    // 1b2) Navigations-links ("Return to …", "Tilbage til …") er aldrig indhold.
+    //      De fjernes på TEKSTEN, ikke på strukturen, fordi de tit har et
+    //      pile-ikon i sig – og oprydningen i step 8 springer alt med billeder
+    //      over, så artiklens egne billeder ikke ryger med.
+    //      Skal ske FØR quiz-konverteringen: en rund pileknap har typisk klassen
+    //      "rounded-full", som quiz-genkendelsen bruger til at finde svar, og så
+    //      ender linket som et punkt i stedet for at blive fjernet.
+    const NAV_TXT =
+      /^(return to|back to|go back|return$|back$|tilbage til|tilbage$|næste|forrige|next (topic|lesson|page|module)|previous (topic|lesson|page|module))/i;
+    const isNav = (t) => !!t && t.length < 80 && NAV_TXT.test(t);
+    root.querySelectorAll('a').forEach((a) => {
+      if (isNav((a.textContent || '').replace(/\s+/g, ' ').trim())) a.remove();
+    });
+
     // 1c) Quiz: konvertér svar-muligheder til punkter PÅ STEDET (så flere quizzer
     //     hver især bevares), FØR step 2 fjerner input/label/button/form.
     //     Håndterer både rigtige <input> OG custom klikbare rækker (role=radio
@@ -468,6 +482,8 @@
       const rowSet = [];
       const pushRow = (el) => {
         if (!el || el === root || !root.contains(el)) return;
+        // Sikkerhedsnet: en rund navigations-knap må aldrig tælle som svar.
+        if (isNav(norm(el.textContent))) return;
         for (const r of rowSet) { if (r === el || r.contains(el) || el.contains(r)) return; }
         rowSet.push(el);
       };
@@ -581,17 +597,6 @@
         const t = (n.textContent || '').trim();
         if (t && t.length < 40 && PLAYER_TXT.test(t)) n.remove();
       }
-    });
-
-    // 1d) Navigations-links ("Return to …", "Tilbage til …") er aldrig indhold.
-    //     De fjernes på TEKSTEN, ikke på strukturen, fordi de tit har et
-    //     pile-ikon i sig – og oprydningen i step 8 springer alt med billeder
-    //     over, så artiklens egne billeder ikke ryger med.
-    const NAV_TXT =
-      /^(return to|back to|go back|return$|back$|tilbage til|tilbage$|næste|forrige|next (topic|lesson|page|module)|previous (topic|lesson|page|module))/i;
-    root.querySelectorAll('a').forEach((a) => {
-      const t = (a.textContent || '').replace(/\s+/g, ' ').trim();
-      if (t && t.length < 80 && NAV_TXT.test(t)) a.remove();
     });
 
     // 2) Strukturel navigation/UI der aldrig er selve artiklen.
