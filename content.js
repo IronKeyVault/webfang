@@ -6,7 +6,7 @@
   // Versioneret vagt. En side der stod åben da udvidelsen blev opdateret, har
   // stadig det GAMLE script kørende; uden versionsnummer ville en ny indsprøjtning
   // blive afvist, og nye funktioner ville lydløst ikke virke.
-  const VERSION = 5;
+  const VERSION = 6;
   if (window.__webfang && window.__webfang.version >= VERSION) return;
   window.__artikelKopierLoaded = true;
 
@@ -375,6 +375,28 @@
       /^(navigation|complementary|banner|contentinfo|search)$/.test(role);
   }
 
+  // Inline <svg> overlever ikke en indsætning i Word – det gør et <img> med
+  // en data-URI. Tegningen pakkes derfor om, så diagrammer i quiz-svar
+  // (og andre steder) kommer med i klippet.
+  function svgToImg(svg) {
+    const img = document.createElement('img');
+    try {
+      const c = svg.cloneNode(true);
+      if (!c.getAttribute('xmlns')) c.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+      // Uden mål gætter Word på 0×0. Fald tilbage på viewBox.
+      const vb = (c.getAttribute('viewBox') || '').trim().split(/[\s,]+/);
+      if (!c.getAttribute('width') && vb.length === 4) c.setAttribute('width', vb[2]);
+      if (!c.getAttribute('height') && vb.length === 4) c.setAttribute('height', vb[3]);
+      if (c.getAttribute('width')) img.setAttribute('width', parseInt(c.getAttribute('width')) || '');
+      const xml = new XMLSerializer().serializeToString(c);
+      img.setAttribute('src',
+        'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(xml))));
+    } catch (_) {
+      return svg; // kunne ikke serialiseres → behold originalen
+    }
+    return img;
+  }
+
   function clean(root, opts = {}) {
     lastQuizCount = 0;
     lastQuizGroups = 0;
@@ -663,8 +685,13 @@
           // Tæl distinkte quizzer: gruppér på nærmeste svar-container.
           const group = row.closest('form, fieldset, [role="radiogroup"], ul, ol') || row.parentElement;
           if (group) quizGroups.add(group);
+          // Billeder/diagrammer i svaret skal med. Punktet bygges af tekst,
+          // men et svar kan være et helt netværksdiagram (Cisco U.'s "Content
+          // Review Question"), og et rent tekst-punkt ville smide det væk.
+          const media = [...row.querySelectorAll('img, svg, picture')]
+            .filter((m) => !m.closest('picture') || m.tagName === 'PICTURE');
           const text = rowText(row);
-          if (!text) { row.remove(); return; }
+          if (!text && !media.length) { row.remove(); return; }
           const correct = isCorrect(row);
           // Sidder svaret i en rigtig liste, bliver punkttegnet sat af listen
           // selv – så skal vi ikke også skrive "•", ellers står der "• •" i Word.
@@ -675,16 +702,29 @@
             ? li : row;
           const parent = target.parentElement;
           const inList = parent && (parent.tagName === 'UL' || parent.tagName === 'OL');
-          const p = document.createElement(inList ? 'li' : 'p');
+          // <div> når der er billeder: en <div> inde i et <p> er ugyldig HTML
+          // og bliver revet fra hinanden når Word parser klippet.
+          const p = document.createElement(inList ? 'li' : (media.length ? 'div' : 'p'));
           if (!inList) p.setAttribute('style', 'margin:2px 0');
           const label = (inList ? '' : '• ') + (correct ? '✓ ' : '') + text;
-          if (correct) {
-            const b = document.createElement('b');
-            b.textContent = label;
-            p.appendChild(b);
-          } else {
-            p.textContent = label;
+          if (text) {
+            if (correct) {
+              const b = document.createElement('b');
+              b.textContent = label;
+              p.appendChild(b);
+            } else {
+              p.appendChild(document.createTextNode(label));
+            }
+          } else if (correct) {
+            p.appendChild(document.createTextNode((inList ? '' : '• ') + '✓'));
           }
+          // Billederne flyttes med over på hver sin linje under teksten.
+          media.forEach((m) => {
+            const line = document.createElement('div');
+            line.setAttribute('style', 'margin:4px 0');
+            line.appendChild(m.tagName === 'svg' ? svgToImg(m) : m);
+            p.appendChild(line);
+          });
           target.replaceWith(p);
           lastQuizCount++;
         });
@@ -764,7 +804,7 @@
 
     // 7) Ryd op i nu-tomme wrappers.
     root.querySelectorAll('div, span, section, p').forEach((n) => {
-      if (!n.querySelector('img') && !(n.textContent || '').trim()) n.remove();
+      if (!n.querySelector('img, svg') && !(n.textContent || '').trim()) n.remove();
     });
 
     // 8) Fjern løsrevne "bare-link"-blokke i toppen og bunden (fx "tilbage til…",

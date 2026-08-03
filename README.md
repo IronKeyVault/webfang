@@ -62,6 +62,9 @@ stadig den gamle udgave af udvidelsens script.
 - **Billeder inlines** som base64 data-URI'er via baggrunds-workeren (som kan
   hente på tværs af oprindelser), så de overlever et paste og ikke bliver til
   døde links.
+- **Quiz-svar** bliver til punkter, og det valgte svar markeres med ✓. Er svaret
+  et diagram (fx Cisco U.'s "Content Review Question"), følger billedet med
+  under teksten — også når svaret kun er et billede.
 - **Rich HTML** lægges på clipboard via Clipboard API (`text/html` + `text/plain`),
   med `document.execCommand('copy')` som fallback.
 
@@ -93,6 +96,8 @@ licensteksten ligger i `vendor/mux.js-LICENSE.txt`. Resten af Webfang er egen ko
 ## Kendte begrænsninger
 
 - CSS-`background-image` kopieres ikke — kun rigtige `<img>`-elementer.
+- Inline `<svg>` pakkes om til et billede, fordi Word taber tegningen ved en
+  indsætning. Kan den ikke serialiseres, ryger den med som den er.
 - Billeder over 12 MB springes over (for at holde clipboard håndterbar).
 - Virker ikke på `chrome://`-sider eller Web Store-sider (browser-spærret).
 - Layout er "godt nok", ikke pixel-perfekt — det er redigerbar tekst + billeder,
