@@ -6,7 +6,7 @@
   // Versioneret vagt. En side der stod åben da udvidelsen blev opdateret, har
   // stadig det GAMLE script kørende; uden versionsnummer ville en ny indsprøjtning
   // blive afvist, og nye funktioner ville lydløst ikke virke.
-  const VERSION = 6;
+  const VERSION = 8;
   if (window.__webfang && window.__webfang.version >= VERSION) return;
   window.__artikelKopierLoaded = true;
 
@@ -676,12 +676,9 @@
         };
 
         // Erstat hver svar-række PÅ STEDET med et punkt (bevarer placering pr. quiz).
-        const quizForms = new Set();
         const quizGroups = new Set();
         rowSet.forEach((row) => {
           if (!root.contains(row)) return; // klonen er detached → brug contains, ikke isConnected
-          const form = row.closest('form, fieldset');
-          if (form && root.contains(form)) quizForms.add(form);
           // Tæl distinkte quizzer: gruppér på nærmeste svar-container.
           const group = row.closest('form, fieldset, [role="radiogroup"], ul, ol') || row.parentElement;
           if (group) quizGroups.add(group);
@@ -729,15 +726,35 @@
           lastQuizCount++;
         });
         lastQuizGroups = quizGroups.size;
-
-        // Beskyt quiz-<form>/<fieldset> mod at blive slettet helt i step 2.
-        quizForms.forEach((f) => {
-          if (!root.contains(f)) return;
-          const div = document.createElement('div');
-          while (f.firstChild) div.appendChild(f.firstChild);
-          f.replaceWith(div);
-        });
       }
+    }
+
+    // 1d) Knapper/labels der bærer INDHOLD. Match-øvelser ("Match the benefit to
+    //     the appropriate security concept") har hverken radioknapper eller runde
+    //     markører – brikkerne ER knapper, og step 2 ville fjerne hele svaret.
+    //     Derfor pakkes indholdsbærende knapper ud til almindelige afsnit, mens
+    //     rene styreknapper (Submit, ✕, Next …) lades tilbage til step 2.
+    {
+      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+      const CTRL_TXT =
+        /^(submit|send|next|previous|prev|back|continue|close|cancel|ok|done|reset|clear|remove match|remove|delete|drag|drop|check|check answer|try again|retry|start|play|pause|search|menu|show me|show more|show answer|show details|show solution|vis mere|vis svar|læs mere|read more|expand|reveal|indsend|næste|forrige|luk|fortryd|nulstil|prøv igen|slet|fjern|søg|[×✕✖x+‹›<>])$/i;
+      root.querySelectorAll('button, [role="button"], label').forEach((b) => {
+        if (!root.contains(b)) return;
+        // Betjeningen inde i brikken (✕, "Remove Match") er ikke indhold.
+        b.querySelectorAll('*').forEach((n) => {
+          if (n.children.length === 0 && CTRL_TXT.test(norm(n.textContent))) n.remove();
+        });
+        const t = norm(b.textContent);
+        // Kun et rigtigt <img> tæller som indhold uden tekst – en knap hvis
+        // eneste indhold er en inline-<svg> er et ikon (✕, pil), ikke et svar.
+        const hasImg = !!b.querySelector('img');
+        // Tom, ren styreknap, navigation eller løst ikon → lad step 2 om den.
+        if (!hasImg && (!t || t.length < 2 || CTRL_TXT.test(t) || isNav(t))) return;
+        const div = document.createElement('div');
+        div.setAttribute('style', 'margin:2px 0');
+        while (b.firstChild) div.appendChild(b.firstChild);
+        b.replaceWith(div);
+      });
     }
 
     // Sikkerhedsnet: fjern løsrevne afspiller-status-linjer selv uden vjs-klasse.
@@ -749,10 +766,22 @@
       }
     });
 
-    // 2) Strukturel navigation/UI der aldrig er selve artiklen.
+    // 2) <form>/<fieldset> pakkes ud i stedet for at blive slettet. En hel
+    //    øvelse kan ligge i en formular – fx match-opgaven på Cisco U., hvor
+    //    brikkerne er almindelige <div>'er – og en sletning ville tage svaret
+    //    med. Selve betjeningen (knapper/felter) ryger lige nedenfor, og en
+    //    formular uden indhold (søgefelt o.l.) står tilbage tom og fjernes af
+    //    oprydningen i step 7.
+    root.querySelectorAll('form, fieldset').forEach((f) => {
+      const div = document.createElement('div');
+      while (f.firstChild) div.appendChild(f.firstChild);
+      f.replaceWith(div);
+    });
+
+    // 2b) Strukturel navigation/UI der aldrig er selve artiklen.
     //    (header beholdes bevidst – artiklens titel ligger tit deri.)
     root.querySelectorAll(
-      'nav, aside, footer, form, button, input, select, textarea, label, fieldset, ' +
+      'nav, aside, footer, button, input, select, textarea, label, ' +
       '[role="navigation"], [role="complementary"], [role="banner"], ' +
       '[role="contentinfo"], [role="search"], [aria-hidden="true"], [hidden]'
     ).forEach((n) => n.remove());
