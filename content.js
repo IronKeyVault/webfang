@@ -6,7 +6,7 @@
   // Versioneret vagt. En side der stod åben da udvidelsen blev opdateret, har
   // stadig det GAMLE script kørende; uden versionsnummer ville en ny indsprøjtning
   // blive afvist, og nye funktioner ville lydløst ikke virke.
-  const VERSION = 8;
+  const VERSION = 9;
   if (window.__webfang && window.__webfang.version >= VERSION) return;
   window.__artikelKopierLoaded = true;
 
@@ -250,6 +250,27 @@
       if (missing.length) {
         Object.assign(map, await inlineInPage(missing));
       }
+
+      // Tredje forsøg: billedet står jo tegnet på siden. Det males over på et
+      // canvas og læses ud som data-URI. Virker uanset om serveren afviser
+      // selve hentningen (fx 403 på grund af manglende referer), så længe
+      // billedet er samme-origin eller CORS-venligt.
+      const stillMissing = urls.filter((u) => !map[u]);
+      if (stillMissing.length) {
+        Object.assign(map, await inlineFromCanvas(stillMissing));
+      }
+
+      // Sidste udvej: et skærmklip af billedet som det står i vinduet. Det
+      // koster opløsning (skærmens, ikke filens), men et billede i klippet er
+      // bedre end et dødt link – og et fremmed-origin billede uden CORS kan
+      // ikke læses ud af et canvas overhovedet.
+      const lastMissing = urls.filter((u) => !map[u]);
+      if (lastMissing.length) {
+        Object.assign(map, await inlineFromScreenshot(lastMissing));
+      }
+
+      const failed = urls.filter((u) => !map[u]);
+      if (failed.length) console.warn('Webfang: kunne ikke indlejre', failed);
     }
     applyImages(clone, map);
     const embedded = urls.filter((u) => map[u]).length;
@@ -271,21 +292,137 @@
   async function inlineInPage(urls) {
     const out = {};
     await Promise.all(urls.map(async (url) => {
-      try {
-        const res = await fetch(url, { credentials: 'include' });
-        if (!res.ok) return;
-        const blob = await res.blob();
-        if (blob.size > 12 * 1024 * 1024) return; // samme grænse som workeren
-        out[url] = await new Promise((resolve, reject) => {
-          const fr = new FileReader();
-          fr.onload = () => resolve(fr.result);
-          fr.onerror = reject;
-          fr.readAsDataURL(blob);
-        });
-      } catch (_) {
-        // Blokeret af CORS → billedet beholder sin original-URL.
+      // Med cookies først. Fejler det, så uden: et CDN der svarer
+      // "Access-Control-Allow-Origin: *" afviser netop de kald der sender
+      // cookies med, og så er et anonymt kald det der lykkes.
+      for (const credentials of ['include', 'omit']) {
+        try {
+          const res = await fetch(url, { credentials });
+          if (!res.ok) continue;
+          const blob = await res.blob();
+          if (blob.size > 12 * 1024 * 1024) return; // samme grænse som workeren
+          out[url] = await new Promise((resolve, reject) => {
+            const fr = new FileReader();
+            fr.onload = () => resolve(fr.result);
+            fr.onerror = reject;
+            fr.readAsDataURL(blob);
+          });
+          return;
+        } catch (_) {
+          // Blokeret af CORS → prøv næste variant, ellers original-URL.
+        }
       }
     }));
+    return out;
+  }
+
+  // Det levende <img> på siden der svarer til en URL vi har samlet op.
+  function liveImageFor(url) {
+    for (const img of document.images) {
+      if (img.currentSrc === url || img.src === url || bestImageUrl(img) === url) return img;
+    }
+    return null;
+  }
+
+  // Mal et allerede indlæst billede over på et canvas og læs det ud igen.
+  // Kaster SecurityError hvis billedet er fremmed-origin uden CORS ("tainted").
+  // Fotos skrives som JPEG – en PNG af et foto fylder mangedobbelt, og hele
+  // klippet skal kunne ligge på udklipsholderen.
+  function canvasDataUrl(img, url) {
+    // Meget store billeder skaleres ned; 2000 px er rigeligt til et dokument.
+    const scale = Math.min(1, 2000 / Math.max(img.naturalWidth, img.naturalHeight));
+    const w = Math.max(1, Math.round(img.naturalWidth * scale));
+    const h = Math.max(1, Math.round(img.naturalHeight * scale));
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    c.getContext('2d').drawImage(img, 0, 0, w, h);
+    return /\.jpe?g(\?|$)/i.test(url)
+      ? c.toDataURL('image/jpeg', 0.92)
+      : c.toDataURL('image/png');
+  }
+
+  async function inlineFromCanvas(urls) {
+    const out = {};
+    await Promise.all(urls.map(async (url) => {
+      const live = liveImageFor(url);
+      if (!live || !live.naturalWidth) return;
+      try {
+        out[url] = canvasDataUrl(live, url);
+        return;
+      } catch (_) {
+        // Tainted canvas → prøv at hente billedet igen som CORS-anmodning.
+      }
+      try {
+        const probe = await new Promise((resolve, reject) => {
+          const i = new Image();
+          i.crossOrigin = 'anonymous';
+          i.onload = () => resolve(i);
+          i.onerror = reject;
+          i.src = url;
+        });
+        out[url] = canvasDataUrl(probe, url);
+      } catch (_) {
+        // Serveren sender ingen CORS-headers → skærmklippet er tilbage.
+      }
+    }));
+    return out;
+  }
+
+  // Skærmklip: scroll billedet ind, bed workeren fotografere fanen, og klip
+  // billedets rektangel ud. Vores egen ramme/værktøjslinje skjules imens, så de
+  // ikke ender oven i billedet.
+  async function inlineFromScreenshot(urls) {
+    const out = {};
+    const overlayShown = overlay.style.display;
+    const toolbarShown = toolbar.style.display;
+    for (const url of urls) {
+      const live = liveImageFor(url);
+      if (!live) continue;
+      try {
+        live.scrollIntoView({ block: 'center' });
+        await sleep(200);
+        const r = live.getBoundingClientRect();
+        // Kun det der faktisk er i vinduet kan fotograferes.
+        const x = Math.max(0, r.left), y = Math.max(0, r.top);
+        const w = Math.min(r.right, window.innerWidth) - x;
+        const h = Math.min(r.bottom, window.innerHeight) - y;
+        if (w < 8 || h < 8) continue;
+
+        overlay.style.display = 'none';
+        toolbar.style.display = 'none';
+        await sleep(60);
+        let shot = null;
+        try {
+          shot = await chrome.runtime.sendMessage({ type: 'CAPTURE_TAB' });
+        } finally {
+          overlay.style.display = overlayShown;
+          toolbar.style.display = toolbarShown;
+        }
+        if (!shot) continue;
+
+        const full = await new Promise((resolve, reject) => {
+          const i = new Image();
+          i.onload = () => resolve(i);
+          i.onerror = reject;
+          i.src = shot;
+        });
+        // Fotoet er i fysiske pixels, rektanglet i CSS-pixels.
+        const dpr = full.width / window.innerWidth || 1;
+        const c = document.createElement('canvas');
+        c.width = Math.round(w * dpr);
+        c.height = Math.round(h * dpr);
+        c.getContext('2d').drawImage(
+          full, Math.round(x * dpr), Math.round(y * dpr),
+          c.width, c.height, 0, 0, c.width, c.height
+        );
+        out[url] = c.toDataURL('image/png');
+      } catch (_) {
+        // Kunne ikke fotograferes → billedet beholder sin original-URL.
+      }
+      // captureVisibleTab er kvoteret til et par kald i sekundet.
+      await sleep(550);
+    }
     return out;
   }
 

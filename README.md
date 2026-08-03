@@ -61,7 +61,9 @@ stadig den gamle udgave af udvidelsens script.
 - **Auto-scroll** kører hele siden igennem, så lazy-loadede billeder når at loade.
 - **Billeder inlines** som base64 data-URI'er via baggrunds-workeren (som kan
   hente på tværs af oprindelser), så de overlever et paste og ikke bliver til
-  døde links.
+  døde links. Afviser serveren hentningen, prøves i tur og orden: sidens egen
+  fetch (med og uden cookies), billedet malet af skærmen via et canvas, og til
+  sidst et skærmklip af billedet som det står i vinduet.
 - **Quiz-svar** bliver til punkter, og det valgte svar markeres med ✓. Er svaret
   et diagram (fx Cisco U.'s "Content Review Question"), følger billedet med
   under teksten — også når svaret kun er et billede.
@@ -99,6 +101,8 @@ licensteksten ligger i `vendor/mux.js-LICENSE.txt`. Resten af Webfang er egen ko
 - Inline `<svg>` pakkes om til et billede, fordi Word taber tegningen ved en
   indsætning. Kan den ikke serialiseres, ryger den med som den er.
 - Billeder over 12 MB springes over (for at holde clipboard håndterbar).
+- Et billede der kun kunne reddes med et skærmklip, har skærmens opløsning —
+  ikke filens — og er beskåret til det der var synligt i vinduet.
 - Virker ikke på `chrome://`-sider eller Web Store-sider (browser-spærret).
 - Layout er "godt nok", ikke pixel-perfekt — det er redigerbar tekst + billeder,
   ikke et screenshot.

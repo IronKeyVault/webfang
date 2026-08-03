@@ -17,6 +17,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true; // hold kanalen åben til det asynkrone svar
   }
 
+  // Sidste udvej for et billede der ikke kan hentes: et foto af fanen, som
+  // content-scriptet selv klipper billedets rektangel ud af.
+  if (msg.type === 'CAPTURE_TAB') {
+    const windowId = sender.tab && sender.tab.windowId;
+    chrome.tabs.captureVisibleTab(windowId, { format: 'png' })
+      .then(sendResponse)
+      .catch(() => sendResponse(null));
+    return true;
+  }
+
   // Content-scriptet spørger: hvilke medie-URL'er har du set på min fane?
   if (msg.type === 'GET_MEDIA') {
     const tabId = sender.tab && sender.tab.id;
