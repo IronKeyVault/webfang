@@ -6,13 +6,13 @@
   // Versioneret vagt. En side der stod åben da udvidelsen blev opdateret, har
   // stadig det GAMLE script kørende; uden versionsnummer ville en ny indsprøjtning
   // blive afvist, og nye funktioner ville lydløst ikke virke.
-  const VERSION = 9;
+  const VERSION = 21;
   if (window.__webfang && window.__webfang.version >= VERSION) return;
   window.__artikelKopierLoaded = true;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  let phase = 'idle'; // 'idle' | 'hover' | 'selected'
+  let phase = 'idle'; // 'idle' | 'hover' | 'region' | 'selected'
   let hoverEl = null;
   let currentEl = null;
   let historyStack = [];
@@ -20,6 +20,13 @@
   let stripLinks = false; // fjern links helt (kun tekst)
   let lastQuizCount = 0;   // antal quiz-svar bevaret ved sidste optag
   let lastQuizGroups = 0;  // antal distinkte quizzer (spørgsmål) ved sidste optag
+  // Afspillere uden plakat-billede: pladsholder i klonen + det levende element
+  // billedet skal hentes fra. Fyldes ud i clean(), opløses i prepare().
+  let pendingFrames = [];
+  // Frihånds-område: de elementer rammen omsluttede, og rammen selv i
+  // DOKUMENT-koordinater (så den overlever at siden scroller undervejs).
+  let regionEls = null;
+  let regionRect = null;
 
   // ---- UI-elementer -------------------------------------------------------
 
@@ -95,9 +102,20 @@
   function positionOverlay(el) {
     if (!el) { overlay.style.display = 'none'; return; }
     const r = el.getBoundingClientRect();
+    let top = r.top, left = r.left, right = r.right, bottom = r.bottom;
+    // Adopteres en afspiller udefra (video og tekst er søskende), så vis det:
+    // rammen dækker begge dele, ellers ser det ud som om videoen ikke er med.
+    const extra = adoptedPlayerBox(el);
+    if (extra) {
+      const p = extra.getBoundingClientRect();
+      if (p.width && p.height) {
+        top = Math.min(top, p.top); left = Math.min(left, p.left);
+        right = Math.max(right, p.right); bottom = Math.max(bottom, p.bottom);
+      }
+    }
     Object.assign(overlay.style, {
-      display: 'block', top: r.top + 'px', left: r.left + 'px',
-      width: r.width + 'px', height: r.height + 'px'
+      display: 'block', top: top + 'px', left: left + 'px',
+      width: (right - left) + 'px', height: (bottom - top) + 'px'
     });
   }
 
@@ -131,7 +149,8 @@
   }
 
   function onScrollResize() {
-    if (phase === 'selected' || phase === 'vselected') positionOverlay(currentEl);
+    if (regionRect) showRegionOverlay();
+    else if (phase === 'selected' || phase === 'vselected') positionOverlay(currentEl);
   }
 
   // ---- Element-valg -------------------------------------------------------
@@ -151,8 +170,16 @@
     prepare();
   }
 
+  // Justerer man valget med knapperne, forlades frihånds-rammen: fra nu af er
+  // det igen ét element der er i spil.
+  function leaveRegion() {
+    if (!regionEls) return;
+    regionEls = regionRect = null;
+  }
+
   btnMore.onclick = () => {
     if (!currentEl || !currentEl.parentElement) return;
+    leaveRegion();
     historyStack.push(currentEl);
     currentEl = currentEl.parentElement;
     positionOverlay(currentEl);
@@ -161,6 +188,7 @@
 
   btnLess.onclick = () => {
     if (!historyStack.length) return;
+    leaveRegion();
     currentEl = historyStack.pop();
     positionOverlay(currentEl);
     prepare();
@@ -181,6 +209,7 @@
   }
 
   btnAll.onclick = () => {
+    leaveRegion();
     const root = pickMainRoot();
     if (currentEl && currentEl !== root) historyStack.push(currentEl);
     currentEl = root;
@@ -215,8 +244,18 @@
 
   // ---- Forberedelse (scroll + inline billeder + byg HTML) -----------------
 
+  const textLen = (el) => (el.textContent || '').replace(/\s+/g, ' ').trim().length;
+
+  function buildClone(el) {
+    const clone = el.cloneNode(true);
+    clean(clone, { stripLinks, liveRoot: el });
+    absolutize(clone);
+    return clone;
+  }
+
   async function prepare() {
     prepared = null;
+    if (!currentEl) return;
     setBusy('Udfolder & henter…');
 
     // 0) Udfold sammenklappet indhold ("Show Me", accordions, <details>).
@@ -228,11 +267,73 @@
     try { currentEl.scrollIntoView({ block: 'start' }); } catch (_) {}
     await sleep(150);
 
-    // 2) Klon og rens.
-    const clone = currentEl.cloneNode(true);
-    clean(clone, { stripLinks, liveRoot: currentEl });
-    absolutize(clone);
+    // 1a) Frihånds-ramme: brug de blokke rammen omsluttede, præcis som de var da
+    //     du slap musen. Ingen gætterier om hoved-indhold og ingen adoption af
+    //     en afspiller udefra – rammen ER valget.
+    if (regionEls) {
+      const regionClone = buildRegionClone();
+      if (!regionClone.children.length) {
+        // Siden har bygget indholdet om mens vi scrollede – blokkene findes ikke
+        // længere. Sig det i stedet for at aflevere et tomt klip.
+        status.textContent = 'Rammens indhold forsvandt – træk den igen';
+        status.style.color = '#fca5a5';
+        return;
+      }
+      const f = await fillFrames(regionClone);
+      await finish(regionClone, f);
+      return;
+    }
 
+    // 1b) Cisco U. og andre SPA'er bygger indholdet om undervejs (også af vores
+    //     egen udfoldning og scroll). Så peger `currentEl` på et element der er
+    //     koblet ud af siden – en tro kopi af noget der ikke findes mere, tit
+    //     helt uden tekst. Vælg da det tilsvarende indhold på den NYE side.
+    if (!currentEl.isConnected) {
+      const again = pickMainRoot();
+      if (again) { currentEl = again; historyStack = []; positionOverlay(currentEl); }
+    }
+
+    // 2) Klon og rens.
+    let clone = buildClone(currentEl);
+
+    // 2a) Blev der ingen tekst ud af det, sad valget på en tom skal (en wrapper
+    //     der kun holder afspilleren, eller en container siden har tømt).
+    //     Prøv sidens hoved-indhold i stedet frem for at aflevere et tomt klip.
+    if (textLen(clone) < 20) {
+      const alt = pickMainRoot();
+      if (alt && alt !== currentEl) {
+        // clean() nulstiller pendingFrames, så pladsholderne i den FØRSTE klon
+        // mister deres afspillere hvis vi ender med at beholde den.
+        const framesOfFirst = pendingFrames;
+        const altClone = buildClone(alt);
+        if (textLen(altClone) > textLen(clone)) {
+          currentEl = alt;
+          historyStack = [];
+          positionOverlay(currentEl);
+          clone = altClone;
+        } else {
+          pendingFrames = framesOfFirst;
+        }
+      }
+    }
+    if (textLen(clone) < 20) {
+      console.warn('Webfang: valget indeholder ingen tekst', currentEl);
+    }
+
+    // 2b) Afspilleren ligger tit i sin EGEN container ved siden af artiklen
+    //     (Cisco U.: video øverst, tekst nedenunder = to søskende), så et valg
+    //     af teksten har den ikke med. Findes der en afspiller på siden som
+    //     valget ikke dækker, sættes dens billede ind øverst i klippet.
+    adoptOutsideVideo(clone);
+
+    // 2c) Afspillere uden plakat: hent billedet fra selve afspilleren.
+    const frames = await fillFrames(clone);
+
+    await finish(clone, frames);
+  }
+
+  // Fælles afslutning: inline billeder, byg HTML og læg et ClipboardItem klar.
+  async function finish(clone, frames) {
     // 3) Saml billed-URL'er og få dem inlinet af baggrunds-workeren.
     const urls = collectImageUrls(clone);
     let map = {};
@@ -284,7 +385,7 @@
       'text/plain': new Blob([text], { type: 'text/plain' })
     });
     prepared = { item, html, text };
-    setReady(urls.length, embedded);
+    setReady(urls.length + frames.total, embedded + frames.filled);
   }
 
   // Hent billeder fra sidens egen kontekst (cookies + referer følger med) og
@@ -372,51 +473,56 @@
   // Skærmklip: scroll billedet ind, bed workeren fotografere fanen, og klip
   // billedets rektangel ud. Vores egen ramme/værktøjslinje skjules imens, så de
   // ikke ender oven i billedet.
-  async function inlineFromScreenshot(urls) {
-    const out = {};
+  async function screenshotElement(live) {
     const overlayShown = overlay.style.display;
     const toolbarShown = toolbar.style.display;
+    live.scrollIntoView({ block: 'center' });
+    await sleep(200);
+    const r = live.getBoundingClientRect();
+    // Kun det der faktisk er i vinduet kan fotograferes.
+    const x = Math.max(0, r.left), y = Math.max(0, r.top);
+    const w = Math.min(r.right, window.innerWidth) - x;
+    const h = Math.min(r.bottom, window.innerHeight) - y;
+    if (w < 8 || h < 8) return null;
+
+    overlay.style.display = 'none';
+    toolbar.style.display = 'none';
+    await sleep(60);
+    let shot = null;
+    try {
+      shot = await chrome.runtime.sendMessage({ type: 'CAPTURE_TAB' });
+    } finally {
+      overlay.style.display = overlayShown;
+      toolbar.style.display = toolbarShown;
+    }
+    if (!shot) return null;
+
+    const full = await new Promise((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = reject;
+      i.src = shot;
+    });
+    // Fotoet er i fysiske pixels, rektanglet i CSS-pixels.
+    const dpr = full.width / window.innerWidth || 1;
+    const c = document.createElement('canvas');
+    c.width = Math.round(w * dpr);
+    c.height = Math.round(h * dpr);
+    c.getContext('2d').drawImage(
+      full, Math.round(x * dpr), Math.round(y * dpr),
+      c.width, c.height, 0, 0, c.width, c.height
+    );
+    return c.toDataURL('image/png');
+  }
+
+  async function inlineFromScreenshot(urls) {
+    const out = {};
     for (const url of urls) {
       const live = liveImageFor(url);
       if (!live) continue;
       try {
-        live.scrollIntoView({ block: 'center' });
-        await sleep(200);
-        const r = live.getBoundingClientRect();
-        // Kun det der faktisk er i vinduet kan fotograferes.
-        const x = Math.max(0, r.left), y = Math.max(0, r.top);
-        const w = Math.min(r.right, window.innerWidth) - x;
-        const h = Math.min(r.bottom, window.innerHeight) - y;
-        if (w < 8 || h < 8) continue;
-
-        overlay.style.display = 'none';
-        toolbar.style.display = 'none';
-        await sleep(60);
-        let shot = null;
-        try {
-          shot = await chrome.runtime.sendMessage({ type: 'CAPTURE_TAB' });
-        } finally {
-          overlay.style.display = overlayShown;
-          toolbar.style.display = toolbarShown;
-        }
-        if (!shot) continue;
-
-        const full = await new Promise((resolve, reject) => {
-          const i = new Image();
-          i.onload = () => resolve(i);
-          i.onerror = reject;
-          i.src = shot;
-        });
-        // Fotoet er i fysiske pixels, rektanglet i CSS-pixels.
-        const dpr = full.width / window.innerWidth || 1;
-        const c = document.createElement('canvas');
-        c.width = Math.round(w * dpr);
-        c.height = Math.round(h * dpr);
-        c.getContext('2d').drawImage(
-          full, Math.round(x * dpr), Math.round(y * dpr),
-          c.width, c.height, 0, 0, c.width, c.height
-        );
-        out[url] = c.toDataURL('image/png');
+        const data = await screenshotElement(live);
+        if (data) out[url] = data;
       } catch (_) {
         // Kunne ikke fotograferes → billedet beholder sin original-URL.
       }
@@ -424,6 +530,155 @@
       await sleep(550);
     }
     return out;
+  }
+
+  // Den største synlige afspiller på siden – uanset hvor i træet den ligger.
+  // Returnerer { video, box }: er afspilleren en iframe (fx en indlejret
+  // afspiller), findes der intet <video> i vores dokument, og så er boksen alt
+  // vi har – den kan stadig fotograferes.
+  function biggestPlayer() {
+    // En afspiller ser ud som en afspiller: bredere end høj, i et rimeligt
+    // billedformat, og den indeholder ikke artiklen. Uden de krav ender vi med
+    // en side-container – og skærmklippet bliver hele siden i stedet for
+    // plakaten (Cisco U. har ingen <video> før man trykker play).
+    const plausible = (el) => {
+      const r = el.getBoundingClientRect();
+      if (r.width < 200 || r.height < 150) return 0;
+      // Bred slide-video (fx 2000×510 = 3,9) er helt normal, så loftet skal
+      // være højt. Det er ikke formatet der holder side-containere ude, men de
+      // to krav nedenfor: en container fylder hele vinduets højde eller
+      // indeholder artiklen – en afspiller gør ingen af delene.
+      const ratio = r.width / r.height;
+      if (ratio < 1.0 || ratio > 6) return 0;
+      if (r.height > window.innerHeight * 0.95) return 0;
+      if (currentEl && el.contains(currentEl)) return 0; // det er en side, ikke en afspiller
+      return r.width * r.height;
+    };
+    const pick = (sel) => {
+      let best = null, bestArea = 0;
+      document.querySelectorAll(sel).forEach((el) => {
+        const area = plausible(el);
+        if (area > bestArea) { bestArea = area; best = el; }
+      });
+      return best;
+    };
+    const v = pick('video');
+    if (v) return { video: v, box: v };
+    // Cisco U. lægger afspilleren i en iframe – der er hverken <video> eller
+    // plakat-klasser i VORES dokument, så uden iframe-kandidaten er der intet at
+    // hente. Den var kortvarigt ude, fordi en fuldskærms-iframe gav et
+    // skærmklip af hele siden; det holder plausible() nu selv styr på.
+    const box = pick('.video-js, [data-vjs-player], [class*="videoplayer"], ' +
+      '[class*="video-player"], [class*="poster"], ' +
+      'iframe[src*="player"], iframe[src*="video"], iframe[allowfullscreen]');
+    return box ? { video: null, box } : null;
+  }
+
+  // Afspilleren der bliver hentet ind udefra for et givet valg – eller null,
+  // hvis valget selv indeholder afspilleren (eller der ingen er).
+  function adoptedPlayerBox(el) {
+    if (!el || !el.querySelector || el.querySelector('video')) return null;
+    const p = biggestPlayer();
+    if (!p || el.contains(p.box)) return null;
+    return p.box;
+  }
+
+  // Har det valgte område ingen afspiller, men siden har én, så adopteres den
+  // ind i klippet som et billede øverst.
+  function adoptOutsideVideo(clone) {
+    if (clone.querySelector('img[data-wf-frame]')) return; // allerede med
+    if (currentEl && currentEl.querySelector && currentEl.querySelector('video')) return;
+    const p = biggestPlayer();
+    if (!p) return;
+    if (currentEl && currentEl.contains(p.box)) return; // afspilleren er allerede med
+    // Har afspilleren en plakat, er den langt bedre end et skærmklip: rigtig
+    // opløsning, ingen play-knap og ingen risiko for at fange resten af siden.
+    // Den bliver hentet og indlejret i det normale billed-trin bagefter.
+    const poster = extractPoster(p.box);
+    if (poster) {
+      try {
+        poster.setAttribute('src', new URL(poster.getAttribute('src'), location.href).href);
+      } catch (_) {}
+      clone.insertBefore(poster, clone.firstChild);
+      return;
+    }
+    const img = document.createElement('img');
+    img.setAttribute('data-wf-frame', String(pendingFrames.length));
+    pendingFrames.push(p);
+    clone.insertBefore(img, clone.firstChild);
+  }
+
+  // Er billedet i praksis ensfarvet (typisk helsort)? En video der afspilles
+  // gennem MSE/EME – eller ligger i et hardware-overlag – tegner nemlig et
+  // SORT rektangel på canvas'et i stedet for at kaste en fejl. Uden dette
+  // tjek ville vi tro det gik godt og aldrig prøve skærmklippet.
+  async function looksBlank(dataUrl) {
+    try {
+      const img = await new Promise((resolve, reject) => {
+        const i = new Image();
+        i.onload = () => resolve(i);
+        i.onerror = reject;
+        i.src = dataUrl;
+      });
+      const n = 16;
+      const c = document.createElement('canvas');
+      c.width = n; c.height = n;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(img, 0, 0, n, n);
+      const px = ctx.getImageData(0, 0, n, n).data;
+      let min = 255, max = 0;
+      for (let i = 0; i < px.length; i += 4) {
+        const lum = 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+        if (lum < min) min = lum;
+        if (lum > max) max = lum;
+      }
+      return max - min < 8; // ingen variation = intet billede
+    } catch (_) {
+      return false; // kan vi ikke måle, så tror vi på billedet
+    }
+  }
+
+  // Afspillere uden plakat: hent det billede der faktisk står på skærmen.
+  // Først selve video-framen via canvas (skarpt, i videoens egen opløsning);
+  // kan den ikke læses ud – tainted canvas ved fremmed-origin uden CORS, eller
+  // et sort felt fordi videoen slet ikke tegnes på canvas – tages et skærmklip
+  // af afspillerens rektangel i stedet.
+  async function fillFrames(root) {
+    const slots = [...root.querySelectorAll('img[data-wf-frame]')];
+    let filled = 0;
+    for (const img of slots) {
+      const spec = pendingFrames[Number(img.getAttribute('data-wf-frame'))];
+      img.removeAttribute('data-wf-frame');
+      let data = null;
+      const v = spec && spec.video;
+      if (v && v.videoWidth && v.readyState >= 2) {
+        try {
+          const scale = Math.min(1, 2000 / Math.max(v.videoWidth, v.videoHeight));
+          const c = document.createElement('canvas');
+          c.width = Math.max(1, Math.round(v.videoWidth * scale));
+          c.height = Math.max(1, Math.round(v.videoHeight * scale));
+          c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+          data = c.toDataURL('image/jpeg', 0.92);
+          if (await looksBlank(data)) data = null;
+        } catch (_) {
+          // Tainted canvas → skærmklip.
+          data = null;
+        }
+      }
+      if (!data && spec && spec.box) {
+        try { data = await screenshotElement(spec.box); } catch (_) {}
+        // Også skærmklippet kan være sort (beskyttet afspilning i et
+        // hardware-overlag). En sort klods i Word er værre end ingenting.
+        if (data && await looksBlank(data)) data = null;
+        await sleep(550);
+      }
+      if (data) { img.setAttribute('src', data); filled++; }
+      else {
+        img.remove(); // intet billede at vise → ingen tom pladsholder
+        console.warn('Webfang: kunne ikke fange billede fra afspilleren');
+      }
+    }
+    return { total: slots.length, filled };
   }
 
   function setBusy(msg) {
@@ -512,6 +767,150 @@
       /^(navigation|complementary|banner|contentinfo|search)$/.test(role);
   }
 
+  // Plakat-billedet fra en afspiller: rigtigt <img>, background-image eller
+  // <video poster>. Bruges både når afspilleren ligger i valget og når den
+  // hentes ind udefra.
+  function extractPoster(player) {
+    // a) rigtigt <img> i plakaten (nyere video.js: <picture>/<img>).
+    const innerImg = player.querySelector(
+      '.vjs-poster img, img.vjs-poster-img, [class*="poster"] img'
+    );
+    if (innerImg && (innerImg.getAttribute('src') || innerImg.getAttribute('srcset'))) {
+      const img = document.createElement('img');
+      if (innerImg.getAttribute('src')) img.setAttribute('src', innerImg.getAttribute('src'));
+      if (innerImg.getAttribute('srcset')) img.setAttribute('srcset', innerImg.getAttribute('srcset'));
+      return img;
+    }
+    // b) background-image på plakaten – som inline style eller fra stylesheet.
+    const pEl = player.querySelector('.vjs-poster, [class*="poster"]') ||
+      (/poster/i.test(player.className || '') ? player : null);
+    const bg = pEl && ((pEl.getAttribute('style') || '') + ';' +
+      (pEl.isConnected ? getComputedStyle(pEl).backgroundImage || '' : ''));
+    const m = bg && bg.match(/url\(["']?(.*?)["']?\)/);
+    if (m && m[1]) {
+      const img = document.createElement('img');
+      img.setAttribute('src', m[1]);
+      return img;
+    }
+    // c) <video poster="...">.
+    const v = player.querySelector('video[poster]');
+    if (v) {
+      const img = document.createElement('img');
+      img.setAttribute('src', v.getAttribute('poster'));
+      return img;
+    }
+    return null;
+  }
+
+  // ---- Tabeller -----------------------------------------------------------
+  //
+  // Moderne sider (Cisco U. m.fl.) bygger tabeller af div'er med CSS-grid eller
+  // ARIA-roller i stedet for <table>. Word ser kun en tabel hvis den ER en
+  // <table> – ellers lander rækkerne som løs tekst under hinanden. Her bygges de
+  // om til en rigtig tabel, og rigtige tabeller får synlige streger med, fordi
+  // sidens CSS ikke følger med i klippet.
+
+  const TABLE_STYLE = 'border-collapse:collapse;';
+  const CELL_STYLE = 'border:1px solid #999;padding:4px 8px;vertical-align:top;';
+
+  function buildTable(rows, headerFirst) {
+    const table = document.createElement('table');
+    table.setAttribute('border', '1');
+    table.setAttribute('cellspacing', '0');
+    table.setAttribute('cellpadding', '6');
+    table.setAttribute('style', TABLE_STYLE);
+    rows.forEach((cells, i) => {
+      const tr = document.createElement('tr');
+      cells.forEach((cell) => {
+        const head = i === 0 && headerFirst;
+        const td = document.createElement(head ? 'th' : 'td');
+        td.setAttribute('style', CELL_STYLE + (head ? 'text-align:left;' : ''));
+        while (cell.firstChild) td.appendChild(cell.firstChild);
+        tr.appendChild(td);
+      });
+      table.appendChild(tr);
+    });
+    return table;
+  }
+
+  // Ser første række ud som overskrifter (fed skrift)?
+  const boldRow = (liveRow) => {
+    const first = liveRow && liveRow.firstElementChild;
+    if (!first || !first.isConnected) return false;
+    return parseInt(getComputedStyle(first).fontWeight) >= 600;
+  };
+
+  // En container med afkrydsninger er en quiz, ikke en tabel – hænderne væk.
+  const isQuizish = (el) =>
+    !!el.querySelector('input[type="radio"], input[type="checkbox"], [class*="rounded-full"]');
+
+  function tablify(root, liveOf) {
+    // a) ARIA-roller: role="table"/"grid" med rækker og celler.
+    root.querySelectorAll('[role="table"], [role="grid"]').forEach((t) => {
+      if (!t.isConnected && !root.contains(t)) return;
+      const rowEls = [...t.querySelectorAll('[role="row"]')];
+      if (rowEls.length < 2) return;
+      const rows = rowEls.map((r) => [...r.querySelectorAll(
+        '[role="cell"], [role="gridcell"], [role="columnheader"], [role="rowheader"]'
+      )]);
+      if (!rows.every((r) => r.length)) return;
+      t.replaceWith(buildTable(rows, !!rowEls[0].querySelector('[role="columnheader"]')));
+    });
+
+    if (!liveOf) return;
+
+    // b) CSS-grid: N kolonner og et antal børn der går op i N.
+    root.querySelectorAll('div, section, ul, ol').forEach((el) => {
+      if (!root.contains(el) || isQuizish(el)) return;
+      const live = liveOf.get(el);
+      if (!live || !live.isConnected) return;
+      const cs = getComputedStyle(live);
+      if (!cs.display.includes('grid')) return;
+      const cols = (cs.gridTemplateColumns || '')
+        .split(/\s+/).filter((x) => x && x !== 'none').length;
+      if (cols < 2) return;
+      const kids = [...el.children];
+      if (kids.length < cols * 2 || kids.length % cols) return;
+      const rows = [];
+      for (let i = 0; i < kids.length; i += cols) rows.push(kids.slice(i, i + cols));
+      el.replaceWith(buildTable(rows, boldRow(live)));
+    });
+
+    // c) Rækker af div'er (flex m.m.): alle rækker har lige mange celler, og
+    //    cellerne i en række står faktisk ved siden af hinanden på skærmen.
+    //    Uden det sidste krav ville enhver liste af kort blive til en tabel.
+    root.querySelectorAll('div, section').forEach((el) => {
+      if (!root.contains(el) || isQuizish(el)) return;
+      const kids = [...el.children];
+      if (kids.length < 3) return;
+      const cols = kids[0].children.length;
+      if (cols < 2 || !kids.every((k) => k.children.length === cols)) return;
+      const live = liveOf.get(el);
+      if (!live || !live.isConnected) return;
+      const sideBySide = kids.every((k) => {
+        const lk = liveOf.get(k);
+        if (!lk || !lk.isConnected) return false;
+        const rs = [...lk.children].map((c) => c.getBoundingClientRect());
+        return rs.every((r) => Math.abs(r.top - rs[0].top) < 6) &&
+          rs[rs.length - 1].right - rs[0].left > 150;
+      });
+      if (!sideBySide) return;
+      el.replaceWith(buildTable(kids.map((k) => [...k.children]), boldRow(live)));
+    });
+
+    // d) Rigtige <table>: sidens streger ligger i CSS'en og følger ikke med.
+    root.querySelectorAll('table').forEach((t) => {
+      if (t.getAttribute('style') === TABLE_STYLE) return; // vores egen
+      t.setAttribute('border', '1');
+      t.setAttribute('cellspacing', '0');
+      t.setAttribute('cellpadding', '6');
+      t.setAttribute('style', ((t.getAttribute('style') || '') + ';' + TABLE_STYLE).replace(/^;/, ''));
+      t.querySelectorAll('td, th').forEach((c) => {
+        c.setAttribute('style', ((c.getAttribute('style') || '') + ';' + CELL_STYLE).replace(/^;/, ''));
+      });
+    });
+  }
+
   // Inline <svg> overlever ikke en indsætning i Word – det gør et <img> med
   // en data-URI. Tegningen pakkes derfor om, så diagrammer i quiz-svar
   // (og andre steder) kommer med i klippet.
@@ -537,6 +936,7 @@
   function clean(root, opts = {}) {
     lastQuizCount = 0;
     lastQuizGroups = 0;
+    pendingFrames = [];
 
     // 0) Klonen er en tro kopi, så vi kan parre hver knude med sin levende
     //    tvilling ved at gå de to træer igennem side om side – FØR oprydningen
@@ -572,37 +972,23 @@
     //     Wrapperen ".video-js" har selv vjs-klasser (fx vjs-paused), så vi kan
     //     ikke bare fjerne alt "vjs-" – vi trækker plakaten ud som rent <img>
     //     og udskifter hele afspilleren (kontrol/status-tekst ryger dermed med).
-    const extractPoster = (player) => {
-      // a) rigtigt <img> i plakaten (nyere video.js: <picture>/<img>).
-      const innerImg = player.querySelector(
-        '.vjs-poster img, img.vjs-poster-img, [class*="poster"] img'
-      );
-      if (innerImg && (innerImg.getAttribute('src') || innerImg.getAttribute('srcset'))) {
-        const img = document.createElement('img');
-        if (innerImg.getAttribute('src')) img.setAttribute('src', innerImg.getAttribute('src'));
-        if (innerImg.getAttribute('srcset')) img.setAttribute('srcset', innerImg.getAttribute('srcset'));
-        return img;
-      }
-      // b) background-image på .vjs-poster.
-      const pEl = player.querySelector('.vjs-poster, [class*="poster"]');
-      const m = pEl && (pEl.getAttribute('style') || '').match(/url\(["']?(.*?)["']?\)/);
-      if (m && m[1]) {
-        const img = document.createElement('img');
-        img.setAttribute('src', m[1]);
-        return img;
-      }
-      // c) <video poster="...">.
-      const v = player.querySelector('video[poster]');
-      if (v) {
-        const img = document.createElement('img');
-        img.setAttribute('src', v.getAttribute('poster'));
-        return img;
-      }
-      return null;
+    // Ingen plakat? Så står billedet alligevel på skærmen – afspilleren viser et
+    // billede (pauset frame eller første frame). Vi sætter en pladsholder ind og
+    // henter selve billedet senere fra det LEVENDE element (frame via canvas,
+    // ellers et skærmklip). Uden det forsvandt det øverste billede i lektioner
+    // hvor afspilleren ikke har poster-attribut.
+    const framePlaceholder = (copy, liveFallback) => {
+      const live = liveOf.get(copy) || liveFallback;
+      if (!live) return null;
+      const liveVideo = live.tagName === 'VIDEO' ? live : live.querySelector('video');
+      const img = document.createElement('img');
+      img.setAttribute('data-wf-frame', String(pendingFrames.length));
+      pendingFrames.push({ video: liveVideo || null, box: live });
+      return img;
     };
 
     root.querySelectorAll('.video-js, [data-vjs-player], [class*="videoplayer"]').forEach((player) => {
-      const img = extractPoster(player);
+      const img = extractPoster(player) || framePlaceholder(player);
       if (img) player.replaceWith(img);
       else player.remove();
     });
@@ -614,12 +1000,18 @@
         const img = document.createElement('img');
         img.setAttribute('src', poster);
         v.replaceWith(img);
-      } else {
-        v.remove();
+        return;
       }
+      const img = framePlaceholder(v);
+      if (img) v.replaceWith(img);
+      else v.remove();
     });
     root.querySelectorAll('[class*="vjs-"], [class*="transcript"]')
       .forEach((n) => n.remove());
+
+    // 1b3) Tabeller bygget af div'er (grid/ARIA) → rigtige <table>. Skal ske før
+    //      oprydningen pakker wrappers ud og river strukturen fra hinanden.
+    tablify(root, liveOf);
 
     // 1b2) Navigations-links ("Return to …", "Tilbage til …") er aldrig indhold.
     //      De fjernes på TEKSTEN, ikke på strukturen, fordi de tit har et
@@ -1079,6 +1471,153 @@
     });
   }
 
+  // ---- Frihånds-område ----------------------------------------------------
+  //
+  // Peg-og-klik kan kun tage ÉT element, og siden bestemmer selv hvor grænserne
+  // går – står video og tekst i hver sin container, kan intet enkelt element
+  // dække begge uden også at tage menuen med. Her trækkes en ramme i stedet, og
+  // alt der ligger helt inden for den kommer med, uanset hvor i træet det står.
+
+  const dragLayer = document.createElement('div');
+  Object.assign(dragLayer.style, {
+    position: 'fixed', inset: '0', zIndex: 2147483645, cursor: 'crosshair',
+    background: 'rgba(0,0,0,0.03)'
+  });
+
+  let dragFrom = null; // {x, y} i dokument-koordinater
+
+  const docRect = (el) => {
+    const r = el.getBoundingClientRect();
+    return {
+      left: r.left + window.scrollX, top: r.top + window.scrollY,
+      right: r.right + window.scrollX, bottom: r.bottom + window.scrollY,
+      width: r.width, height: r.height
+    };
+  };
+
+  // Tegn rammen (gemt i dokument-koordinater) i vinduet.
+  function showRegionOverlay() {
+    if (!regionRect) { overlay.style.display = 'none'; return; }
+    Object.assign(overlay.style, {
+      display: 'block',
+      left: (regionRect.left - window.scrollX) + 'px',
+      top: (regionRect.top - window.scrollY) + 'px',
+      width: (regionRect.right - regionRect.left) + 'px',
+      height: (regionRect.bottom - regionRect.top) + 'px'
+    });
+  }
+
+  // De STØRSTE elementer der ligger helt inden for rammen. Et element der kun
+  // rager delvist ind, åbnes i stedet, så dets indre dele kan komme med – ellers
+  // ville en container der stikker uden for rammen tage alt eller intet.
+  function elementsInRect(rect) {
+    const slop = 4;
+    const inside = (b) =>
+      b.left >= rect.left - slop && b.right <= rect.right + slop &&
+      b.top >= rect.top - slop && b.bottom <= rect.bottom + slop;
+    const overlaps = (b) =>
+      b.left < rect.right && b.right > rect.left &&
+      b.top < rect.bottom && b.bottom > rect.top;
+
+    const out = [];
+    const walk = (el) => {
+      for (const child of el.children) {
+        if (isOurUI(child) || child === dragLayer) continue;
+        const b = docRect(child);
+        if (!b.width && !b.height) continue;
+        if (inside(b)) out.push(child);
+        else if (overlaps(b)) walk(child);
+      }
+    };
+    walk(document.body);
+    return out;
+  }
+
+  // Klipper flere løsrevne blokke sammen til ét dokument. Hver blok renses for
+  // sig (så quiz-genkendelse og video-plakater virker pr. blok), og pladsholder-
+  // numrene skrives om, fordi clean() nulstiller listen for hver blok.
+  function buildRegionClone() {
+    const wrap = document.createElement('div');
+    const all = [];
+    regionEls.forEach((el) => {
+      if (!el.isConnected) return;
+      const c = buildClone(el);
+      const offset = all.length;
+      c.querySelectorAll('img[data-wf-frame]').forEach((img) => {
+        img.setAttribute('data-wf-frame',
+          String(offset + Number(img.getAttribute('data-wf-frame'))));
+      });
+      all.push(...pendingFrames);
+      wrap.appendChild(c);
+    });
+    pendingFrames = all;
+    return wrap;
+  }
+
+  function onRegionDown(e) {
+    if (phase !== 'region' || e.button !== 0) return;
+    e.preventDefault();
+    dragFrom = { x: e.clientX + window.scrollX, y: e.clientY + window.scrollY };
+    regionRect = { left: dragFrom.x, top: dragFrom.y, right: dragFrom.x, bottom: dragFrom.y };
+    showRegionOverlay();
+  }
+
+  function onRegionMove(e) {
+    if (phase !== 'region' || !dragFrom) return;
+    const x = e.clientX + window.scrollX, y = e.clientY + window.scrollY;
+    regionRect = {
+      left: Math.min(dragFrom.x, x), right: Math.max(dragFrom.x, x),
+      top: Math.min(dragFrom.y, y), bottom: Math.max(dragFrom.y, y)
+    };
+    showRegionOverlay();
+  }
+
+  function onRegionUp(e) {
+    if (phase !== 'region' || !dragFrom) return;
+    dragFrom = null;
+    if (!regionRect ||
+        regionRect.right - regionRect.left < 20 ||
+        regionRect.bottom - regionRect.top < 20) {
+      regionRect = null;
+      overlay.style.display = 'none';
+      toast('Rammen var for lille – træk en større', 2500);
+      return;
+    }
+    const els = elementsInRect(regionRect);
+    if (!els.length) {
+      toast('Ingenting inden for rammen – prøv at trække lidt bredere', 3000);
+      return;
+    }
+    regionEls = els;
+    // Et fælles ophæng, så ⬆ Mere stadig har et sted at klatre op fra.
+    currentEl = els[0].parentElement || document.body;
+    historyStack = [];
+    phase = 'selected';
+    dragLayer.remove();
+    document.removeEventListener('mousedown', onRegionDown, true);
+    document.removeEventListener('mousemove', onRegionMove, true);
+    document.removeEventListener('mouseup', onRegionUp, true);
+    toolbar.style.display = 'flex';
+    showRegionOverlay();
+    prepare();
+  }
+
+  function startPickRegion() {
+    if (phase !== 'idle') return;
+    phase = 'region';
+    regionEls = regionRect = null;
+    mount();
+    toolbar.style.display = 'none';
+    document.documentElement.appendChild(dragLayer);
+    document.addEventListener('mousedown', onRegionDown, true);
+    document.addEventListener('mousemove', onRegionMove, true);
+    document.addEventListener('mouseup', onRegionUp, true);
+    document.addEventListener('keydown', onKey, true);
+    window.addEventListener('scroll', onScrollResize, true);
+    window.addEventListener('resize', onScrollResize, true);
+    toast('Træk en ramme om det du vil have med (du må gerne scrolle undervejs – Esc = fortryd)', 5000);
+  }
+
   function startPick() {
     if (phase !== 'idle') return;
     phase = 'hover';
@@ -1101,6 +1640,11 @@
     hoverEl = currentEl = null;
     historyStack = [];
     prepared = null;
+    regionEls = regionRect = dragFrom = null;
+    dragLayer.remove();
+    document.removeEventListener('mousedown', onRegionDown, true);
+    document.removeEventListener('mousemove', onRegionMove, true);
+    document.removeEventListener('mouseup', onRegionUp, true);
     document.removeEventListener('mousemove', onMove, true);
     document.removeEventListener('click', onClick, true);
     document.removeEventListener('keydown', onKey, true);
@@ -1327,7 +1871,11 @@
   // stod åben under opdateringen, og starte optaget to gange.
   window.__webfang = {
     version: VERSION,
-    start: (what) => { what === 'video' ? startPickVideo() : startPick(); }
+    start: (what) => {
+      if (what === 'video') startPickVideo();
+      else if (what === 'område') startPickRegion();
+      else startPick();
+    }
   };
 
   chrome.runtime.onMessage.addListener((msg) => {

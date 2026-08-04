@@ -6,7 +6,8 @@ OneNote eller mail.
 
 ## Sådan bruges den
 
-1. Tryk på udvidelsens ikon → **Optag artikel**.
+1. Tryk på udvidelsens ikon → **Optag artikel** (eller **▦ Marker område**, se
+   nedenfor, hvis du hellere vil trække rammen selv).
 2. Peg og klik på artiklen på siden (blå ramme viser hvad der bliver valgt).
 3. Juster valget med **⬆ Mere** / **⬇ Mindre** hvis rammen skal dække mere/mindre.
 4. Vent til statuslinjen siger **Klar** (den scroller siden igennem og henter
@@ -14,6 +15,20 @@ OneNote eller mail.
 5. Indsæt med **Ctrl+V** hvor du vil.
 
 Tryk **Esc** for at fortryde.
+
+## Marker et område selv
+
+Passer indholdet ikke i ét element — fx når videoen står i sin egen kasse over
+teksten — så tryk **▦ Marker område** og træk en ramme om det du vil have.
+
+Alt der ligger helt inden for rammen kommer med, uanset hvor i sidens struktur
+det står. Et element der kun rager delvist ind, bliver åbnet, så de dele af det
+der ER inden for rammen, kommer med. Du må gerne scrolle midt i trækket; rammen
+holder fast i siden, ikke i skærmen. Resten er som før: statuslinjen siger
+**Klar**, og du trykker **📋 Kopiér**.
+
+Trykker du bagefter **⬆ Mere**, **⬇ Mindre** eller **📄 Hele siden**, forlades
+rammen, og valget er igen ét element.
 
 ## Hent video
 
@@ -64,6 +79,18 @@ stadig den gamle udgave af udvidelsens script.
   døde links. Afviser serveren hentningen, prøves i tur og orden: sidens egen
   fetch (med og uden cookies), billedet malet af skærmen via et canvas, og til
   sidst et skærmklip af billedet som det står i vinduet.
+- **Videoafspillere** bliver til ét billede: plakaten hvis afspilleren har en,
+  ellers det billede der faktisk står i afspilleren (video-framen læst af et
+  canvas, eller et skærmklip hvis videoen er fremmed-origin uden CORS). Før
+  forsvandt en afspiller uden `poster` helt — typisk lektionens øverste billede.
+  Ligger afspilleren i sin egen container ved siden af teksten (Cisco U.: video
+  øverst, artikel nedenunder), bliver den hentet ind øverst i klippet alligevel,
+  så man ikke skal ramme begge dele med rammen.
+- **Tabeller** bliver til rigtige `<table>`. Mange sider bygger tabeller af
+  div'er med CSS-grid eller ARIA-roller, og dem ser Word kun som løs tekst under
+  hinanden. De bygges om til en tabel med streger og fed overskriftsrække — også
+  rigtige `<table>`, hvis streger ellers ville blive i sidens CSS. Containere med
+  afkrydsninger er fredet, så en quiz ikke bliver til en tabel.
 - **Quiz-svar** bliver til punkter, og det valgte svar markeres med ✓. Er svaret
   et diagram (fx Cisco U.'s "Content Review Question"), følger billedet med
   under teksten — også når svaret kun er et billede.

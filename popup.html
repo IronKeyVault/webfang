@@ -13,6 +13,8 @@
     button:hover { background: #1d4ed8; }
     button + button { margin-top: 8px; background: #7c3aed; }
     button + button:hover { background: #6d28d9; }
+    #startRegion { background: #0f766e; }
+    #startRegion:hover { background: #115e59; }
     .hint { font-size: 11px; color: #888; margin-top: 10px; line-height: 1.4; }
     .err {
       display: none; margin-top: 10px; padding: 8px; border-radius: 6px;
@@ -34,8 +36,11 @@
 </head>
 <body>
   <h1>📋 Webfang</h1>
-  <p>Tryk Optag, klik på det du vil have – artiklen kopieres til udklipsholderen, videoen hentes som fil.</p>
+  <p>Tryk Optag, klik på det du vil have – artiklen kopieres til udklipsholderen,
+     videoen hentes som fil. Passer siden ikke i ét element, så træk selv en ramme
+     med <b>Marker område</b>.</p>
   <button id="start">Optag artikel</button>
+  <button id="startRegion">▦ Marker område</button>
   <button id="startVideo">🎬 Optag video</button>
   <div id="err" class="err"></div>
   <div class="seq">

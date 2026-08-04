@@ -51,6 +51,8 @@ async function startPick(what) {
 
 document.getElementById('start')
   .addEventListener('click', () => startPick('artikel'));
+document.getElementById('startRegion')
+  .addEventListener('click', () => startPick('område'));
 document.getElementById('startVideo')
   .addEventListener('click', () => startPick('video'));
 
