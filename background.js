@@ -62,9 +62,17 @@ chrome.commands.onCommand.addListener(async (command) => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab || !tab.id) return;
   try {
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+    // Fil-listen står ét sted – i manifestet – så indsprøjtning og automatisk
+    // indlæsning aldrig kan komme ud af trit.
+    // allFrames: sidens iframes skal også have koden – indhold der ligger i en
+    // ramme (fx midterpanelet på en lab-side) hentes af rammen selv.
     await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
+      target: { tabId: tab.id, allFrames: true },
+      files: chrome.runtime.getManifest().content_scripts[0].js
+    });
+    // Selve optaget startes KUN i hovedrammen; den spørger rammerne selv.
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id, frameIds: [0] },
       func: (w) => { if (window.__webfang) window.__webfang.start(w); },
       args: [what]
     });

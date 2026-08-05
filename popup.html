@@ -32,6 +32,14 @@
     }
     .seq .saved { font-size: 11px; color: #16a34a; visibility: hidden; }
     .seq .note { font-size: 11px; color: #888; margin-top: 4px; line-height: 1.35; }
+    #diag { margin-top: 8px; background: #4b5563; }
+    #diag:hover { background: #374151; }
+    #diagOut {
+      display: none; margin-top: 10px; padding: 8px; max-height: 340px; overflow: auto;
+      background: #0f172a; color: #e2e8f0; border-radius: 6px;
+      font: 11px/1.45 ui-monospace, Consolas, monospace; white-space: pre-wrap;
+      cursor: copy;
+    }
   </style>
 </head>
 <body>
@@ -42,7 +50,9 @@
   <button id="start">Optag artikel</button>
   <button id="startRegion">▦ Marker område</button>
   <button id="startVideo">🎬 Optag video</button>
+  <button id="diag">🔎 Diagnose</button>
   <div id="err" class="err"></div>
+  <pre id="diagOut" title="Klik for at kopiere"></pre>
   <div class="seq">
     <label><input type="checkbox" id="seqOn"> Nummerér videoer</label>
     <div class="row">

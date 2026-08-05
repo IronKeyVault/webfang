@@ -23,7 +23,9 @@ teksten — så tryk **▦ Marker område** og træk en ramme om det du vil have
 
 Alt der ligger helt inden for rammen kommer med, uanset hvor i sidens struktur
 det står. Et element der kun rager delvist ind, bliver åbnet, så de dele af det
-der ER inden for rammen, kommer med. Du må gerne scrolle midt i trækket; rammen
+der ER inden for rammen, kommer med. Ligger en del af indholdet i sin egen
+iframe — som midterpanelet på en lab-side — kommer den med på samme vilkår: kun
+det rammen dækker. Du må gerne scrolle midt i trækket; rammen
 holder fast i siden, ikke i skærmen. Resten er som før: statuslinjen siger
 **Klar**, og du trykker **📋 Kopiér**.
 
@@ -58,6 +60,21 @@ Skal en enkelt video et andet sted hen, så sæt flueben i **Spørg hvor filen s
 gemmes** i popup'en. Så åbner browserens egen gem-dialog, hvor du kan browse frit;
 den husker selv sidste placering.
 
+## Når noget ikke kommer med
+
+Tryk **🔎 Diagnose** i popup'en (helst mens et optag står **Klar**). Svaret vises
+i popup'en — klik på det for at kopiere det — og fortæller hvor indholdet blev
+tabt:
+
+- **hoved-rod** og **valg**: hvad 📄 Hele siden ville tage, og hvad der er valgt nu.
+- **tekst-tunge blokke**: sidens paneler, hvor store de er, og om de overhovedet
+  ligger inden for valget (`i valget: NEJ` = det er *udvælgelsen* der er problemet).
+- **efter oprydning** + **trin der fjerner**: hvor meget tekst hvert oprydningstrin
+  i `src/55-clean.js` fjerner fra panelet (`junk-klasser: 8400→120` = det trin
+  spiser panelet).
+
+Diagnosen ændrer ikke siden: alt måles på kopier, og tilstanden lægges tilbage.
+
 ## Sådan installeres den (uden Web Store)
 
 1. Åbn `chrome://extensions` (eller `edge://extensions`).
@@ -91,11 +108,68 @@ stadig den gamle udgave af udvidelsens script.
   hinanden. De bygges om til en tabel med streger og fed overskriftsrække — også
   rigtige `<table>`, hvis streger ellers ville blive i sidens CSS. Containere med
   afkrydsninger er fredet, så en quiz ikke bliver til en tabel.
-- **Quiz-svar** bliver til punkter, og det valgte svar markeres med ✓. Er svaret
+- **Afkrydsningsfelter og ikoner** i en quiz kommer ikke med som billeder. Word
+  tegner ikke inline-SVG, men reserverer pladsen — hver afkrydsningsboks blev til
+  en tom kasse, og ti svar til flere siders luft. Samtidig fjernes sidens egne
+  `height`/`padding`-styles fra klippet: de er lavet til en skærm med sidens CSS,
+  ikke til et Word-dokument, og var den anden halvdel af luften.
+- **Quiz-svar** bliver til punkter, og det valgte svar markeres med ✓ — også når
+  afkrydsningen kun findes som DOM-egenskab på siden (`.checked`), hvilket er
+  det normale, og ikke som attribut i HTML'en. Er svaret
   et diagram (fx Cisco U.'s "Content Review Question"), følger billedet med
   under teksten — også når svaret kun er et billede.
+- **Delte sider** (flere indholdspaneler ved siden af hinanden — fx en lab-side
+  med opgaven i venstre panel og scenariet i midten) tages under ét. `<main>`
+  dækker tit kun det ene panel, så findes der andre store tekstpaneler uden for
+  buddet, flyttes valget op til det fælles ophæng — men kun hvis det ikke slæber
+  hele siden med.
+- **Paneler med deres egen scroll** tages helt. Deres kasse er kun det synlige,
+  mens indholdet inden i er meget højere; rammede frihånds-rammen ikke kassen
+  præcist, fik man før kun de linjer der lige stod på skærmen.
+- **Indhold i iframes** kommer med. Mange sider – fx Cisco U.'s lab-sider – er
+  sat sammen af paneler, hvor midterpanelet er sin egen iframe med sin egen URL
+  og sin egen scroll. Udefra er den ét tomt element, så før forsvandt netop den
+  midterste del af klippet. Nu kører Webfang i alle rammer: den ydre side sætter
+  en pladsholder ind og beder rammen om sit eget færdige klip, som sættes ind i
+  stedet. Rammen henter sine egne billeder med sine egne cookies, og spørger på
+  samme måde de rammer den selv indeholder. Dækker frihånds-rammen kun en del af
+  en iframe, får den kun den del med. Svarer en ramme ikke (fx en PDF-viser,
+  hvor udvidelser ikke må køre), springes den over frem for at låse optaget.
 - **Rich HTML** lægges på clipboard via Clipboard API (`text/html` + `text/plain`),
   med `document.execCommand('copy')` som fallback.
+
+## Kodens opbygning
+
+Content-scriptet er delt i moduler under `src/`, der indsprøjtes i rækkefølge og
+deler ét navnerum (`window.__wf`). Hver fil registrerer sig med
+`WF.def(navn, fn)`, så en gen-indsprøjtning på en side der allerede har koden,
+lydløst springer over. Fil-listen står **kun** i `manifest.json`; både popup'en
+og genvejstasterne læser den derfra med `chrome.runtime.getManifest()`.
+
+| Fil | Ansvar |
+| --- | --- |
+| `src/00-core.js` | Navnerum, versions-vagt, små hjælpere |
+| `src/05-state.js` | Al delt tilstand + løbenummer for en forberedelse |
+| `src/10-text.js` | Tekst- og klassemønstre (junk, navigation, styreknapper) |
+| `src/20-ui.js` | Ramme, værktøjslinje, knapper, beskeder, status |
+| `src/30-page.js` | Scroll, udfoldning af sammenklappet indhold, valg af rod |
+| `src/40-media.js` | Afspillere → ét billede (plakat, video-frame, skærmklip) |
+| `src/45-tables.js` | Grid/ARIA/div-rækker → rigtige `<table>` |
+| `src/50-quiz.js` | Svar-rækker → punkter, markering af det valgte svar |
+| `src/55-clean.js` | Oprydningen som en pipeline af navngivne trin |
+| `src/60-images.js` | Billed-URL'er + de fire hente-forsøg |
+| `src/70-capture.js` | Fra valg til færdigt `ClipboardItem` |
+| `src/75-iframes.js` | Indhold i iframes: pladsholder + samtale med rammen |
+| `src/80-region.js` | Frihånds-rammen |
+| `src/85-video.js` | Video-optag (kilder, valg, hentning) |
+| `src/90-app.js` | Knap-handlinger, start/stop, `window.__webfang` |
+| `src/95-diagnose.js` | Måler hvorfor et panel ikke kom med (🔎 Diagnose) |
+
+Røgtest (kræver `npm i jsdom`, kører hele optaget i et falsk DOM):
+
+```
+node test/smoke.js
+```
 
 ## Hvordan video-hentning virker
 
@@ -128,6 +202,10 @@ licensteksten ligger i `vendor/mux.js-LICENSE.txt`. Resten af Webfang er egen ko
 - Inline `<svg>` pakkes om til et billede, fordi Word taber tegningen ved en
   indsætning. Kan den ikke serialiseres, ryger den med som den er.
 - Billeder over 12 MB springes over (for at holde clipboard håndterbar).
+- Skærmklip-redningen (sidste udvej for billeder) tager højst 8 billeder pr.
+  optag. Hvert klip kræver at siden scrolles og fotograferes, og på "Hele siden"
+  ville flere dusin gøre optaget minutlangt — og nå at bygge en SPA om under os.
+- Udfoldningen af sammenklappet indhold klikker højst 40 steder, af samme grund.
 - Et billede der kun kunne reddes med et skærmklip, har skærmens opløsning —
   ikke filens — og er beskåret til det der var synligt i vinduet.
 - Virker ikke på `chrome://`-sider eller Web Store-sider (browser-spærret).

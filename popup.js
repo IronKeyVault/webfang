@@ -1,11 +1,15 @@
 // Starter et optag på den aktive fane. Samme mønster for artikel og video –
 // kun argumentet til content-scriptet er forskelligt.
 //
-// Vi indsprøjter ALTID content.js først (den er selv-versionerende og gør intet
-// hvis den nyeste udgave allerede kører) og kalder derefter dens start-funktion
-// direkte. Det er med vilje ikke en besked: en side der stod åben da udvidelsen
-// blev opdateret, har stadig det gamle script kørende, og en besked ville ryge
-// derhen og lydløst ikke gøre noget.
+// Vi indsprøjter ALTID content-modulerne først (de er selv-versionerende og gør
+// intet hvis den nyeste udgave allerede kører) og kalder derefter deres
+// start-funktion direkte. Det er med vilje ikke en besked: en side der stod åben
+// da udvidelsen blev opdateret, har stadig det gamle script kørende, og en
+// besked ville ryge derhen og lydløst ikke gøre noget.
+
+// Listen står ét sted – i manifestet – så indsprøjtning og automatisk
+// indlæsning aldrig kan komme ud af trit.
+const contentFiles = () => chrome.runtime.getManifest().content_scripts[0].js;
 
 const err = document.getElementById('err');
 
@@ -14,22 +18,36 @@ function showError(msg) {
   err.style.display = 'block';
 }
 
-async function startPick(what) {
-  err.style.display = 'none';
-
+// Fælles forarbejde: find fanen, afvis sider hvor udvidelser ikke må køre, og
+// sørg for at content-modulerne er indsprøjtet. Returnerer fanen, eller null
+// hvis der allerede er vist en fejl.
+async function readyTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab || !tab.id) return showError('Ingen aktiv fane.');
+  if (!tab || !tab.id) { showError('Ingen aktiv fane.'); return null; }
 
   const url = tab.url || '';
   if (/^(chrome|edge|about|devtools|chrome-extension):/.test(url) ||
       url.startsWith('https://chromewebstore.google.com')) {
-    return showError('Browseren tillader ikke udvidelser på denne side. Prøv på en almindelig webside.');
+    showError('Browseren tillader ikke udvidelser på denne side. Prøv på en almindelig webside.');
+    return null;
   }
 
+  // allFrames: også sidens iframes får koden, så indhold i en ramme kan komme
+  // med. Selve optaget startes kun i hovedrammen (frameIds: [0]).
+  await chrome.scripting.executeScript({
+    target: { tabId: tab.id, allFrames: true }, files: contentFiles()
+  });
+  return tab;
+}
+
+async function startPick(what) {
+  err.style.display = 'none';
+
   try {
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
+    const tab = await readyTab();
+    if (!tab) return;
     const [res] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
+      target: { tabId: tab.id, frameIds: [0] },
       func: (w) => {
         if (!window.__webfang) return 'ikke-indlæst';
         window.__webfang.start(w);
@@ -48,6 +66,46 @@ async function startPick(what) {
 
   window.close();
 }
+
+// ---------------------------------------------------------------- diagnose ---
+//
+// "Hvorfor kom netop det panel ikke med?" måles på siden selv og vises her i
+// popup'en. Konsollen er ikke et rimeligt sted at bede om svaret: den ligger
+// bag F12, kræver at man vælger content-scriptets egen verden, og Edge spærrer
+// oven i købet for at indsætte kode i den.
+
+const diagOut = document.getElementById('diagOut');
+
+document.getElementById('diag').addEventListener('click', async () => {
+  err.style.display = 'none';
+  diagOut.style.display = 'block';
+  diagOut.textContent = 'Måler…';
+  try {
+    const tab = await readyTab();
+    if (!tab) { diagOut.style.display = 'none'; return; }
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id, frameIds: [0] },
+      func: () => (window.__webfang && window.__webfang.diagnose
+        ? window.__webfang.diagnose()
+        : 'Webfang er ikke indlæst på siden – genindlæs den med F5.')
+    });
+    diagOut.textContent = (res && res.result) || 'Intet svar fra siden.';
+    // Rapporten er bredere end knapperne; popup'en må gerne fylde mens den vises.
+    document.body.style.width = '460px';
+  } catch (e) {
+    diagOut.textContent = 'Fejl: ' + (e.message || e);
+  }
+});
+
+// Klik på rapporten kopierer den, så den kan limes ind et andet sted.
+diagOut.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText(diagOut.textContent);
+    const first = diagOut.textContent;
+    diagOut.textContent = 'kopieret ✓\n\n' + first;
+    setTimeout(() => { diagOut.textContent = first; }, 1200);
+  } catch (_) { /* uden clipboard kan man stadig markere teksten */ }
+});
 
 document.getElementById('start')
   .addEventListener('click', () => startPick('artikel'));

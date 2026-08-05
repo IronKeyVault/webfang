@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Webfang",
-  "version": "1.4.2",
+  "version": "1.7.1",
   "description": "Optag en artikel fra en webside inkl. billeder og kopiér til udklipsholder som rich HTML – eller hent sidens video ned som fil.",
   "permissions": [
     "activeTab",
@@ -33,7 +33,25 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "js": [
+        "src/00-core.js",
+        "src/05-state.js",
+        "src/10-text.js",
+        "src/20-ui.js",
+        "src/30-page.js",
+        "src/40-media.js",
+        "src/45-tables.js",
+        "src/50-quiz.js",
+        "src/55-clean.js",
+        "src/60-images.js",
+        "src/70-capture.js",
+        "src/75-iframes.js",
+        "src/80-region.js",
+        "src/85-video.js",
+        "src/90-app.js",
+        "src/95-diagnose.js"
+      ],
+      "all_frames": true,
       "run_at": "document_idle"
     }
   ]
