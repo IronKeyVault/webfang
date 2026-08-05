@@ -113,6 +113,19 @@ stadig den gamle udgave af udvidelsens script.
   en tom kasse, og ti svar til flere siders luft. Samtidig fjernes sidens egne
   `height`/`padding`-styles fra klippet: de er lavet til en skærm med sidens CSS,
   ikke til et Word-dokument, og var den anden halvdel af luften.
+- **Kode-blokke beholder deres linjeskift.** Et svar der er en CLI-sekvens er
+  fire linjer, ikke én sætning — klemt sammen er det en anden konfiguration end
+  den der stod på skærmen. Både `<pre>`/`<code>` og en `<div>` som sidens CSS har
+  givet `white-space: pre` genkendes. Har teksten ingen linjeskift i sig — en
+  highlighter lægger tit hver linje i sit eget element — hentes linjerne fra
+  layoutet: to tekststumper der ikke deler lodret position, står på hver sin
+  linje. Kan den levende tvilling ikke findes, læses linjerne af strukturen i
+  stedet: `<br>`, blok-elementer og elementer hvis klasse siger "linje"
+  (highlight.js lægger hver linje i sin egen `<span class="hljs-input-line">`).
+  Tre kilder, fordi ingen af dem holder alene: kildens whitespace findes ikke,
+  layoutet kræver at elementet stadig er i siden, og sidens CSS følger ikke med
+  i klippet. Linjerne skrives som `<br>`: Word læser gerne vores `font-family`,
+  men ignorerer `white-space` — uden `<br>` stod sekvensen på én linje alligevel.
 - **Quiz-svar** bliver til punkter, og det valgte svar markeres med ✓ — også når
   afkrydsningen kun findes som DOM-egenskab på siden (`.checked`), hvilket er
   det normale, og ikke som attribut i HTML'en. Er svaret
@@ -136,7 +149,10 @@ stadig den gamle udgave af udvidelsens script.
   en iframe, får den kun den del med. Svarer en ramme ikke (fx en PDF-viser,
   hvor udvidelser ikke må køre), springes den over frem for at låse optaget.
 - **Rich HTML** lægges på clipboard via Clipboard API (`text/html` + `text/plain`),
-  med `document.execCommand('copy')` som fallback.
+  med `document.execCommand('copy')` som fallback. Klippet slutter altid med et
+  almindeligt, tomt afsnit: ender det midt i en punktopstilling, står markøren
+  efter indsæt stadig i listen, og så bliver alt hvad man skriver eller indsætter
+  bagefter også til punkter.
 
 ## Kodens opbygning
 

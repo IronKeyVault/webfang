@@ -64,7 +64,8 @@
     // den levende side. Findes parringen ikke, matches der på tekst.
     function liveFinder(root, opts, liveOf) {
       const liveRows = opts.liveRoot ? [...opts.liveRoot.querySelectorAll(
-        'input[type=radio],input[type=checkbox],[role=radio],[role=checkbox],[role=option],button,label,li'
+        'input[type=radio],input[type=checkbox],[role=radio],[role=checkbox],' +
+        '[role=option],button,label,li,td,pre'
       )] : [];
       return (row) => {
         const paired = liveOf.get(row);
@@ -209,6 +210,42 @@
       return norm(c.textContent);
     }
 
+    // Er svaret en kode-blok? Så ER linjeskiftene indholdet: fire CLI-linjer
+    // klemt sammen til én sætning er ikke bare grimt, det er en anden
+    // kommando-sekvens end den der stod på skærmen. Både et rigtigt <pre>/<code>
+    // og en <div> som sidens CSS har givet white-space: pre tæller.
+    function preformatted(row, findLive) {
+      if (row.matches('pre, code') || row.querySelector('pre, code')) return true;
+      const live = findLive(row);
+      if (!live || !live.isConnected || !live.querySelectorAll) return false;
+      const isPre = (el) => {
+        try { return /^pre/.test(getComputedStyle(el).whiteSpace || ''); } catch (_) { return false; }
+      };
+      if (isPre(live)) return true;
+      const inner = [...live.querySelectorAll('*')];
+      return inner.length < 200 && inner.some(isPre);
+    }
+
+    // Kode-blokkens tekst MED linjeskift. Rækkefølgen af forsøg er vigtig:
+    // textContent har kun linjeskift hvis kilden selv har dem, og en
+    // highlighter der lægger hver linje i sit eget element har dem ikke –
+    // dér findes linjerne kun i layoutet.
+    function rowTextPre(row, findLive) {
+      const live = findLive(row);
+      // Linjerne som de står på skærmen. Først når geometrien ikke kan svare
+      // (elementet er ikke i siden længere), falder vi tilbage til teksten selv.
+      const geo = WF.util.livePreText(live);
+      if (geo.indexOf('\n') >= 0) return geo;
+      // Ingen levende tvilling: læs linjerne af klonens egen struktur.
+      const structural = WF.util.clonePreText(row);
+      if (structural.indexOf('\n') >= 0) return structural;
+      const raw = (live && live.innerText) || row.textContent || '';
+      return raw.replace(/\u00a0/g, ' ')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    }
+
     // Billeder/diagrammer i svaret skal med. Punktet bygges af tekst, men et
     // svar kan være et helt netværksdiagram (Cisco U.'s "Content Review
     // Question"), og et rent tekst-punkt ville smide det væk.
@@ -226,7 +263,7 @@
         ? li : row;
     }
 
-    function buildBullet(target, text, media, correct) {
+    function buildBullet(target, text, media, correct, pre) {
       const parent = target.parentElement;
       // Sidder svaret i en rigtig liste, bliver punkttegnet sat af listen selv –
       // så skal vi ikke også skrive "•", ellers står der "• •" i Word.
@@ -234,16 +271,22 @@
       // <div> når der er billeder: en <div> inde i et <p> er ugyldig HTML og
       // bliver revet fra hinanden når Word parser klippet.
       const p = document.createElement(inList ? 'li' : (media.length ? 'div' : 'p'));
-      if (!inList) WF.util.setOwnStyle(p, 'margin:2px 0');
+      // Kode-svar: linjeskiftene skal stå. pre-wrap frem for <pre>, så punktet
+      // stadig ombryder i Word i stedet for at løbe ud over sidekanten.
+      const style = 'margin:2px 0' +
+        (pre ? ';white-space:pre-wrap;font-family:Consolas,\'Courier New\',monospace' : '');
+      if (!inList || pre) WF.util.setOwnStyle(p, style);
       const bullet = inList ? '' : '• ';
       if (text) {
         const label = bullet + (correct ? '✓ ' : '') + text;
+        // Linjeskift skrives som <br>: Word ignorerer white-space, men aldrig
+        // et <br>. Uden det stod en firelinjet CLI-sekvens som én linje.
         if (correct) {
           const b = document.createElement('b');
-          b.textContent = label;
+          WF.util.setLines(b, label);
           p.appendChild(b);
         } else {
-          p.appendChild(document.createTextNode(label));
+          WF.util.setLines(p, label);
         }
       } else if (correct) {
         p.appendChild(document.createTextNode(bullet + '✓'));
@@ -292,16 +335,22 @@
         if (!root.contains(row)) return;
 
         const media = mediaIn(row, liveOf);
-        const text = rowText(row);
+        const pre = preformatted(row, findLive);
+        const text = pre ? rowTextPre(row, findLive) : rowText(row);
         if (!text && !media.length) { row.remove(); return; }
         const target = replaceTarget(root, row);
-        target.replaceWith(buildBullet(target, text, media, isCorrect(row)));
+        target.replaceWith(buildBullet(target, text, media, isCorrect(row), pre));
         count++;
       });
 
       return { count, groups: groups.size };
     }
 
-    WF.quiz = { convert };
+    // Til 🔎 Diagnose: de enkelte beslutninger skal kunne aflæses hver for sig,
+    // ellers er "hvorfor kom kode-blokken ud på én linje" ren gætteri.
+    WF.quiz = {
+      convert,
+      inspect: { collectRows, liveFinder, preformatted, rowText, rowTextPre }
+    };
   });
 })();

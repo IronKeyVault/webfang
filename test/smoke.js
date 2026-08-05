@@ -28,6 +28,14 @@ const html = `<!doctype html><html><body>
     <div role="row"><div role="cell">v1</div><div role="cell">v2</div></div>
   </div>
   <details><summary>Vis mere</summary><p>Skjult tekst der skal med.</p></details>
+  <ul class="quiz3">
+    <li><input type="radio" id="k1"><label for="k1"><pre>R4(config)# interface tunnel0
+R4(config-if)# tunnel source 10.10.3.2
+R4(config-if)# tunnel destination 10.10.1.1</pre></label></li>
+    <li><input type="radio" id="k2"><label for="k2"><pre>R4(config)# interface tunnel0
+R4(config-if)# tunnel source GigabitEthernet 0/0</pre></label></li>
+    <li><input type="radio" id="k3"><label for="k3"><pre class="language-cisco-ios hljs"><strong><span class="hljs-input-line"><span class="hljs-user-input">R1(config)# interface tunnel1</span></span><span class="hljs-input-line"><span class="hljs-user-input">R1(config-if)# tunnel mode gre ip</span></span></strong></pre></label></li>
+  </ul>
   <div class="quiz2">
     <div class="answer" style="height:72px;padding:24px 0">
       <input type="checkbox" id="c1" class="sr-only">
@@ -102,8 +110,8 @@ for (const f of files) {
   check('billede indlejret', /src="data:image\/png/.test(out));
   check('quiz-svar som punkter', /Svar et/.test(out) && /Svar to/.test(out));
   check('valgt svar markeret', /✓/.test(out));
-  // To quizzer på siden: radio-listen (2 svar) og afkrydsnings-listen (3 svar).
-  check('quiz talt', WF.state.lastQuizCount === 5 && WF.state.lastQuizGroups >= 2);
+  // Tre quizzer: radio-listen (2 svar), kode-listen (3) og afkrydsningerne (3).
+  check('quiz talt', WF.state.lastQuizCount === 8 && WF.state.lastQuizGroups === 3);
   check('ARIA-tabel blev <table>', (out.match(/<table/g) || []).length >= 2);
   check('tabel-streger', /border-collapse/.test(out));
   check('udfoldet <details>-tekst med', /Skjult tekst/.test(out));
@@ -114,6 +122,20 @@ for (const f of files) {
   check('sidens højde-styles væk', !/height:\s*72px/.test(out) && !/padding:\s*24px/.test(out));
   check('vores egne afstande beholdt', /margin:2px 0/.test(out));
   check('mærke ikke med i klippet', !/data-wf=/.test(out));
+  // Kode-svar: linjeskiftene ER indholdet – fire CLI-linjer på én linje er en
+  // anden kommando-sekvens end den der stod på skærmen.
+  // <br> og ikke \n: Word læser gerne vores font-family, men ignorerer
+  // white-space – uden <br> stod hele sekvensen på én linje.
+  check('kode-svar beholder linjeskift',
+    /interface tunnel0<br>R4\(config-if\)# tunnel source 10\.10\.3\.2/.test(out));
+  check('kode-svar sat som pre-wrap', /white-space:pre-wrap/.test(out));
+  // Highlighter-mønstret: hver linje i sin egen <span class="hljs-input-line">,
+  // uden ét eneste linjeskift i teksten. Linjerne findes kun i strukturen.
+  check('linjer læst af strukturen',
+    /interface tunnel1<br>R1\(config-if\)# tunnel mode gre ip/.test(out));
+  // Uden et afsluttende almindeligt afsnit fortsætter Word punktopstillingen
+  // ned i alt hvad man skriver eller indsætter bagefter.
+  check('klippet slutter uden for listen', /<p style="margin:0">&nbsp;<\/p>$/.test(out));
 
   // Iframe: klonen får en pladsholder, rammen spørges via postMessage, og dens
   // svar sættes ind. Rammen selv (den anden side af samtalen) står her som en
@@ -176,6 +198,21 @@ for (const f of files) {
   panels.innerHTML = '<div id="venstre"><p>' + long('opgaven her') +
     '</p></div><div id="midt"><p>' + long('scenariet i midterpanelet') + '</p></div>';
   window.document.body.appendChild(panels);
+  // Kode-blok hvor linjerne KUN findes i layoutet: hver linje i sit eget
+  // element, ingen linjeskift i teksten. jsdom laver ikke layout, så tops
+  // stubbes – én linje pr. tekstknude.
+  const cli = window.document.createElement('div');
+  cli.innerHTML = '<span>R4(config)# interface tunnel0</span>' +
+    '<span>R4(config-if)# tunnel source 10.10.3.2</span>';
+  window.document.body.appendChild(cli);
+  let topN = 0;
+  window.Range.prototype.getBoundingClientRect = () => ({
+    width: 200, height: 18, top: (topN++) * 18, left: 0, right: 200, bottom: 18
+  });
+  check('linjer hentet fra layoutet',
+    WF.util.livePreText(cli) ===
+      'R4(config)# interface tunnel0\nR4(config-if)# tunnel source 10.10.3.2');
+
   const root = WF.page.pickMainRoot();
   check('hoved-rod tager begge paneler med',
     root.contains(window.document.getElementById('midt')) &&

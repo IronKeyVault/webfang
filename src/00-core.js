@@ -9,7 +9,7 @@
 // stadig det GAMLE script kørende. Uden versionsnummer ville en ny indsprøjtning
 // blive afvist, og nye funktioner ville lydløst ikke virke.
 (() => {
-  const VERSION = 25;
+  const VERSION = 31;
   if (window.__wf && window.__wf.version >= VERSION) return;
 
   const WF = { version: VERSION, _mods: Object.create(null) };
@@ -49,6 +49,89 @@
     };
   };
 
+  // Teksten i et LEVENDE element, opdelt i linjer efter hvor de faktisk står på
+  // skærmen. Kode-blokke er tit bygget med hver linje i sit eget element og
+  // UDEN linjeskift i selve teksten – linjerne findes kun i layoutet. Hverken
+  // textContent (ser ingen linjer) eller innerText (afhænger af sidens CSS, som
+  // vi ikke sender med) kan så genskabe dem, men geometrien kan: to tekststumper
+  // der ikke deler lodret position, står på hver sin linje.
+  const livePreText = (live) => {
+    if (!live || !live.isConnected || !live.ownerDocument) return '';
+    let walker, range;
+    try {
+      walker = live.ownerDocument.createTreeWalker(live, NodeFilter.SHOW_TEXT);
+      range = live.ownerDocument.createRange();
+    } catch (_) { return ''; }
+
+    const lines = [];
+    let top = null, line = '';
+    while (walker.nextNode()) {
+      const raw = walker.currentNode.nodeValue || '';
+      if (!raw.trim()) continue;
+      let r;
+      try {
+        range.selectNodeContents(walker.currentNode);
+        r = range.getBoundingClientRect();
+      } catch (_) { continue; }
+      if (!r || (!r.width && !r.height)) continue;
+      if (top !== null && Math.abs(r.top - top) > 3) { lines.push(line); line = ''; }
+      line += raw;
+      top = r.top;
+    }
+    if (line) lines.push(line);
+
+    return lines.map((l) => l.replace(/\u00a0/g, ' ').replace(/\s+$/, '')).join('\n').trim();
+  };
+
+  // Samme opgave, men på KLONEN – uden adgang til siden. Bruges når geometrien
+  // ikke kan svare (den levende tvilling kan ikke findes). Linjerne læses af
+  // strukturen: <br>, blok-elementer, og elementer hvis klasse siger "linje"
+  // (highlightere som highlight.js lægger hver linje i sin egen
+  // <span class="hljs-input-line">, helt uden linjeskift i teksten).
+  const LINE_ISH = 'br, div, p, li, tr, [class*="line"]';
+
+  const clonePreText = (el) => {
+    const lines = [];
+    let cur = '';
+    const flush = () => { if (cur.trim()) lines.push(cur); cur = ''; };
+
+    // `inLine` holder styr på at KUN den yderste linje-agtige knude bryder.
+    // Highlightere pakker prompt og kommando i hver sit element inde i samme
+    // linje, og uden det ville "R4(config)# interface tunnel0" blive til to.
+    const walk = (node, inLine) => {
+      node.childNodes.forEach((n) => {
+        if (n.nodeType === 3) { cur += n.nodeValue; return; }
+        if (n.nodeType !== 1) return;
+        if (n.tagName === 'BR') { flush(); return; }
+        let lineish = false;
+        try { lineish = !inLine && n.matches(LINE_ISH); } catch (_) {}
+        if (lineish) flush();
+        walk(n, inLine || lineish);
+        if (lineish) flush();
+      });
+    };
+    walk(el, false);
+    flush();
+
+    return lines.map((l) => l.replace(/\u00a0/g, ' ').replace(/\s+$/, '')).join('\n').trim();
+  };
+
+  // Flerlinjet tekst ind i et element – som tekst og <br>, ikke som linjeskift.
+  //
+  // Word læser vores inline styles, men IKKE white-space: den tager gerne
+  // font-family fra et punkt og klemmer så alligevel linjerne sammen til én.
+  // <br> er det eneste linjeskift Word altid respekterer. Derfor sættes
+  // linjerne ind hver for sig, uden \n imellem (ellers ville en browser med
+  // pre-wrap vise dobbelt luft).
+  const setLines = (el, text) => {
+    const lines = String(text).split('\n');
+    lines.forEach((line, i) => {
+      if (i) el.appendChild(el.ownerDocument.createElement('br'));
+      el.appendChild(el.ownerDocument.createTextNode(line));
+    });
+    return el;
+  };
+
   // Vores EGEN styling på et element vi selv har bygget. Mærket data-wf gør at
   // oprydningens slankning af sidens højde-/afstands-styles ikke tager vores
   // med – den ved ellers ikke hvem der har sat hvad.
@@ -85,7 +168,7 @@
 
   WF.util = {
     sleep, norm, textLen, esc, docRect, rgb, saturated, loadImage, absUrl, inFrame,
-    setOwnStyle
+    setOwnStyle, setLines, livePreText, clonePreText
   };
 
   window.__wf = WF;

@@ -168,8 +168,14 @@
       WF.ui.setReady(urls.length + frames.total, embedded + frames.filled);
     }
 
+    // Slutter klippet midt i en punktopstilling, står markøren efter indsæt
+    // stadig i listen – og så bliver ALT man skriver eller indsætter bagefter
+    // også til punkter. Derfor et almindeligt, tomt afsnit til sidst: det
+    // afslutter listen, så det næste man laver i Word starter på en frisk linje.
+    const LIST_END = '<p style="margin:0">&nbsp;</p>';
+
     function wrapHtml(clone) {
-      return '<meta charset="utf-8">' + clone.outerHTML;
+      return '<meta charset="utf-8">' + clone.outerHTML + LIST_END;
     }
 
     // Fald tilbage til selektions-baseret kopiering hvis Clipboard API fejler.

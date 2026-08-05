@@ -192,7 +192,64 @@
       });
     }
 
-    // 14) Ryd op i nu-tomme wrappers.
+    // 14) Kode-blokke uden <pre>. Mange sider sætter linjeskiftene med CSS
+    //     (white-space: pre på en <div>), og den CSS følger ikke med i klippet –
+    //     så Word klemmer en CLI-sekvens sammen til én linje. Er den levende
+    //     tvilling preformateret, skrives det med som inline style.
+    //     Skal ske EFTER slankningen, ellers mærker vi elementet som "vores" og
+    //     redder sidens egne højde-styles med.
+    // Ser elementet ud som en kode-blok, også uden hjælp fra siden? Et <pre> er
+    // det pr. definition, og highlightere skriver deres eget spor i klassen.
+    const CODE_CLASS = /(^|\s|-)(hljs|highlight|language-|lang-|font-mono|code-block|codeblock)/i;
+
+    const looksCode = (n) =>
+      n.tagName === 'PRE' || CODE_CLASS.test((n.className || '').toString());
+
+    function keepPreformatted(root, liveOf) {
+      root.querySelectorAll('pre, code, div, span, p, td, li').forEach((n) => {
+        // Yderste blok vinder; dens indre elementer er væk bagefter.
+        if (!root.contains(n)) return;
+        if (n.parentElement && n.parentElement.closest('pre')) return;
+        const txt = n.textContent || '';
+        if (!txt.trim()) return;
+
+        // Den levende tvilling er en HJÆLP, ikke et krav. Parringen falder fra
+        // hinanden på første gren hvor klon og side ikke har lige mange børn
+        // (en SPA bygger om mens vi arbejder), og før krævede dette trin den –
+        // så på præcis de sider hvor kode-blokke ikke kom rigtigt ud, kørte
+        // rettelsen slet ikke.
+        const live = liveOf && liveOf.get(n);
+        let preformatted = looksCode(n);
+        if (!preformatted && live && live.isConnected) {
+          try { preformatted = /^pre/.test(getComputedStyle(live).whiteSpace || ''); } catch (_) {}
+        }
+        if (!preformatted) return;
+
+        // Står linjerne kun i layoutet (hver linje i sit eget element, ingen
+        // linjeskift i teksten), så hentes de fra skærmen – ellers af klonens
+        // egen struktur. Farvelægningen ryger, men den fulgte alligevel ikke
+        // med: den kommer fra sidens CSS-fil.
+        if (txt.indexOf('\n') < 0) {
+          const geo = live && live.isConnected ? WF.util.livePreText(live) : '';
+          const lines = geo.indexOf('\n') >= 0 ? geo : WF.util.clonePreText(n);
+          if (lines.indexOf('\n') >= 0) {
+            n.textContent = '';
+            WF.util.setLines(n, lines);
+          }
+        } else {
+          // Har teksten linjeskift, står de kun i kildens whitespace – og den
+          // rører Word ikke ved uden white-space. Skriv dem som <br>.
+          n.textContent = '';
+          WF.util.setLines(n, txt.replace(/\r/g, '').replace(/[ \t]+\n/g, '\n').trim());
+        }
+        WF.util.setOwnStyle(n,
+          ((n.getAttribute('style') || '') +
+            ';white-space:pre-wrap;font-family:Consolas,\'Courier New\',monospace')
+            .replace(/^;/, ''));
+      });
+    }
+
+    // 15) Ryd op i nu-tomme wrappers.
     function dropEmptyWrappers(root) {
       root.querySelectorAll('div, span, section, p').forEach((n) => {
         if (!n.querySelector('img, svg') && !(n.textContent || '').trim()) n.remove();
@@ -250,6 +307,7 @@
       ['event-handlers', (root) => stripEventHandlers(root)],
       ['ikon-svg', (root, ctx) => removeIconSvgs(root, ctx.liveOf)],
       ['højde-styles', (root) => slimStyles(root)],
+      ['kode-linjeskift', (root, ctx) => keepPreformatted(root, ctx.liveOf)],
       ['tomme wrappers', (root) => dropEmptyWrappers(root)],
       ['løse links i kanten', (root) => trimBareLinks(root)],
       // Mærket har gjort sit; det skal ikke med i klippet. (data-wf-frame og

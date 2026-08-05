@@ -76,6 +76,74 @@
       return { start, end: prev, drops };
     }
 
+    // ---- Kode-blokke -------------------------------------------------------
+
+    // Linjeskift vises som ⏎, så en flerlinjet blok kan stå på én linje i
+    // rapporten uden at man er i tvivl om hvor linjerne går.
+    const oneLine = (s, max) => {
+      const t = s.replace(/\n/g, ' ⏎ ');
+      return t.length > max ? t.slice(0, max) + '…' : t;
+    };
+
+    const lineCount = (s) => (s ? s.split('\n').length : 0);
+
+    // Yderste kode-blokke på siden.
+    function codeBlocks(max) {
+      const all = [...document.querySelectorAll(
+        'pre, code, [class*="hljs"], [class*="language-"], [class*="font-mono"]'
+      )];
+      return all
+        .filter((e) => !all.some((o) => o !== e && o.contains(e)))
+        .filter((e) => (e.textContent || '').trim())
+        .slice(0, max);
+    }
+
+    // Hvad ser de tre kilder? Det er dem der er uenige når en CLI-sekvens
+    // lander på én linje.
+    function codeReport(say) {
+      const blocks = codeBlocks(4);
+      if (!blocks.length) return;
+      say('');
+      say('Kode-blokke:');
+      const sel = WF.state.currentEl;
+      blocks.forEach((el, i) => {
+        const txt = el.textContent || '';
+        const geo = WF.util.livePreText(el);
+        const struct = WF.util.clonePreText(el);
+        say((i + 1) + '. ' + label(el) +
+          (sel ? ' · i valget: ' + (sel.contains(el) ? 'ja' : 'NEJ') : ''));
+        say('   tekstens egne linjeskift: ' + (txt.indexOf('\n') >= 0 ? 'ja' : 'nej') +
+          ' · layout: ' + lineCount(geo) + ' linjer' +
+          ' · struktur: ' + lineCount(struct) + ' linjer');
+        say('   → ' + oneLine(struct || geo || WF.util.norm(txt), 150));
+      });
+    }
+
+    // Hvad beslutter quiz-koden for hver svar-række? Kører på en KOPI, præcis
+    // som optaget selv gør, så svaret er det rigtige og siden er urørt.
+    function quizReport(say) {
+      const root = WF.state.currentEl || WF.page.pickMainRoot();
+      if (!root || !WF.quiz.inspect) return;
+      const q = WF.quiz.inspect;
+      const clone = root.cloneNode(true);
+      const liveOf = WF.clean.pairWithLive(clone, root);
+      const findLive = q.liveFinder(clone, { liveRoot: root }, liveOf);
+      const rows = q.collectRows(clone);
+      if (!rows.length) return;
+
+      say('');
+      say('Quiz-rækker (' + rows.length + ' – som optaget ser dem):');
+      rows.slice(0, 6).forEach((row, i) => {
+        const isPre = q.preformatted(row, findLive);
+        const text = isPre ? q.rowTextPre(row, findLive) : q.rowText(row);
+        say((i + 1) + '. ' + label(row) +
+          ' · kode: ' + (isPre ? 'ja' : 'NEJ') +
+          ' · levende tvilling: ' + (findLive(row) ? 'ja' : 'NEJ') +
+          ' · linjer: ' + lineCount(text));
+        say('   → ' + oneLine(text, 150));
+      });
+    }
+
     function run() {
       const s = WF.state;
       const out = [];
@@ -117,6 +185,9 @@
           (t.end < t.start * 0.5 ? '  ← MISTER indhold' : ''));
         if (t.drops.length) say('   trin der fjerner: ' + t.drops.join(' | '));
       });
+
+      codeReport(say);
+      quizReport(say);
 
       const text = out.join('\n');
       console.log('Webfang diagnose:\n' + text);
