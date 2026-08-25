@@ -36,7 +36,8 @@ rammen, og valget er igen ét element.
 
 1. Tryk på udvidelsens ikon → **🎬 Optag video** (eller Alt+X).
 2. Klik på videoen/afspilleren på siden.
-3. Er der flere kilder, vælg i dropdown'en — den største/bedste ligger øverst.
+3. Er der flere kilder, vælg i dropdown'en — den længste ligger øverst, og
+   spilletiden står på hver linje (`⏱ 3:27:51`).
 4. Tryk **⬇ Hent video**. Filen lander i Overførsler.
 
 Finder den ingenting, så start afspilningen et par sekunder og prøv igen —
@@ -182,14 +183,24 @@ og genvejstasterne læser den derfra med `chrome.runtime.getManifest()`.
 | `src/70-capture.js` | Fra valg til færdigt `ClipboardItem` |
 | `src/75-iframes.js` | Indhold i iframes: pladsholder + samtale med rammen |
 | `src/80-region.js` | Frihånds-rammen |
-| `src/85-video.js` | Video-optag (kilder, valg, hentning) |
+| `src/85-video.js` | Video-optag (kilder, rangering, undersøgelse, hentning) |
 | `src/90-app.js` | Knap-handlinger, start/stop, `window.__webfang` |
 | `src/95-diagnose.js` | Måler hvorfor et panel ikke kom med (🔎 Diagnose) |
+
+Uden for `src/` ligger `mp4-mux.js`, som lægger et videospor og et lydspor
+sammen til én MP4 (indlæses i `offscreen.html`).
 
 Røgtest (kræver `npm i jsdom`, kører hele optaget i et falsk DOM):
 
 ```
 node test/smoke.js
+```
+
+Test af sammenlægningen (ingen afhængigheder — bygger små MP4'er med mærkede
+chunks og læser den samlede fil på de nye offsets):
+
+```
+node test/mux.js
 ```
 
 ## Hvordan video-hentning virker
@@ -198,6 +209,28 @@ node test/smoke.js
 - Bruger afspilleren streaming, er `src` en `blob:`-URL der er ubrugelig uden for
   siden. Derfor lytter baggrunds-workeren med på fanens netværkstrafik og noterer
   de playlister/mediefiler den ser (`webRequest` — kun observerende, intet blokeres).
+- **Kilderne rangeres, ikke bare måles på størrelsen.** En side med et galleri
+  af videoer henter forhåndsvisninger for hvert miniaturebillede, og en stream
+  henter sine stumper som `.mp4`-filer — så listen kan sagtens rumme 30+ URL'er.
+  Størrelsen udpeger den forkerte: en playliste på 3½ time fylder få kilobyte,
+  mens ét segment fylder megabyte. Derfor kommer playlister først, hele filer
+  dernæst, og stumper (`seg-12-v1-a1.mp4`, `chunk-…`, `00012.mp4`, alt med
+  `range/` i stien eller `?range=a-b`) sidst.
+- **Vimeo** (fx kbits.live) bruger hverken `.m3u8` eller `.mpd`, men en signeret
+  JSON-playliste. Hvert spor er én mp4-fil skåret i byte-intervaller, og hvert
+  interval har sin egen signatur i stien (`range/prot/<base64>/…&pathsig=…`) —
+  så URL'en til hele filen findes ikke, og man kan ikke selv regne den ud.
+  Playlisten er det eneste sted alle intervallerne står samlet; derfor opsnappes
+  den (`/v2/playlist/…`, `playlist.json`, `master.json`) og bruges som kilde.
+  Uden den så Webfang kun de få hundrede kilobyte afspilleren lige havde hentet.
+- **Playlisternes spilletid måles.** Så snart en kilde er valgt, åbnes de
+  playlister der blev fundet, og deres `#EXTINF`/`mediaPresentationDuration`
+  lægges sammen. Listen sorterer sig selv om med den længste øverst — det er
+  filmen — og spilletiden står på hver linje. Det sker i baggrunden, så
+  ⬇ Hent video kan bruges med det samme.
+- **🔎 Kilder** undersøger alle kilder og kopierer en rapport: længde,
+  antal kvaliteter, segmenter, AES/DRM, live-flag, størrelse og hele URL'en for
+  hver. Det er den knap man trykker på, når den hentede fil ikke er hele videoen.
 - Ved **HLS** (`.m3u8`) og **DASH** (`.mpd`) hentes alle segmenter og samles til
   én fil i et offscreen-dokument (en service worker har hverken DOM, XML-parser
   eller blob-URL'er).
@@ -207,9 +240,27 @@ node test/smoke.js
 - Almindelig AES-128-transportkryptering dekrypteres undervejs. **DRM-beskyttet
   indhold (Widevine/FairPlay/SAMPLE-AES) afvises med en klar fejl** — det bryder
   Webfang ikke.
-- Har en DASH-stream lyden liggende adskilt fra videoen, bliver det to filer
-  (`… (video).mp4` og `… (lyd).m4a`), og statuslinjen siger det. At blande dem
-  til én fil kræver en rigtig muxer, og den har Webfang ikke.
+- **Ligger lyden adskilt fra videoen** — som den gør hos både DASH og Vimeo —
+  lægges de to spor sammen til én `.mp4` til sidst. Det er ren ompakning:
+  billed- og lyddata røres ikke, kun containeren bygges om, så der hverken
+  genkodes eller tabes kvalitet. Der er to slags MP4, og de skal samles på hver
+  sin måde:
+  - **Fragmenteret** (`moof`+`mdat` i tusindvis — det Vimeo leverer): hvert
+    fragment beskriver sine samples relativt til sig selv (`tfhd`-flaget
+    default-base-is-moof), så de kan flyttes frit. Begge spors `traf` lægges i
+    **én** `moof` pr. tidsinterval med ét fælles `mdat` bagefter, og hver
+    `traf`s `data_offset` regnes om til sin plads i det. Ét spor pr. `moof` er
+    lige så lovligt og lettere at skrive — men VLC afspiller ikke lyden af
+    sådan en fil: den viser sporet i menuen og tier. Chrome klarer den fint,
+    hvilket gør fejlen let at overse. Desuden får lyden nyt spor-nummer i
+    hvert eneste fragment, og `mvex` en `trex` pr. spor.
+  - **Progressiv** (ét `moov` med fulde sample-tabeller): her er `stco`/`co64`
+    absolutte filpositioner, og når mediedata flyttes bag et nyt, større `moov`,
+    peger hver eneste af dem forkert. Filen ville se hel ud, have alle sine
+    bytes, og alligevel være ubrugelig.
+
+  Går sammenlægningen galt, får du de to spilbare filer i stedet plus grunden i
+  statuslinjen — to filer er bedre end ingen.
 
 ## Tredjepartskode
 
@@ -236,3 +287,10 @@ licensteksten ligger i `vendor/mux.js-LICENSE.txt`. Resten af Webfang er egen ko
 - Live-streams understøttes ikke (`type="dynamic"` i DASH afvises).
 - Hele videoen holdes i hukommelsen mens den samles, så meget lange film kan
   blive tunge.
+- Hastigheden er ikke til at skrue meget på. Hvert segment er sin egen
+  HTTP-forespørgsel, og `CONCURRENCY` i `offscreen.js` (8) bestemmer hvor mange
+  der er i luften ad gangen. Resten sætter CDN'en, din linje og rundturstiden
+  pr. forespørgsel — og ved små segmenter er det ventetiden på svar, ikke
+  båndbredden, der koster. Statuslinjen viser MB/s og resttid, så man kan se
+  om en ændring hjælper. Sætter man tallet for højt, begynder serveren at
+  afvise (429), og flere segmenter ligger i hukommelsen samtidig.

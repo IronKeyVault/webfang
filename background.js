@@ -34,6 +34,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // Content-scriptet beder om at få kilderne undersøgt (🔎 Kilder).
+  if (msg.type === 'PROBE_MEDIA') {
+    probeAll(msg.items || []).then(sendResponse);
+    return true;
+  }
+
   // Content-scriptet beder om at få en konkret video hentet.
   if (msg.type === 'DOWNLOAD_MEDIA') {
     const tabId = sender.tab && sender.tab.id;
@@ -156,11 +162,32 @@ function scheduleSave() {
 // Segmenter og småfiler er støj – vi vil kun have playlister og hele videofiler.
 const SEGMENT_RE = /\.(ts|m4s|aac|vtt|key|jpg|png)(\?|$)/i;
 
+// fMP4-segmenter hedder .mp4 og slipper derfor forbi SEGMENT_RE. De ligner
+// hinanden på navnet: seg-12-v1-a1.mp4, chunk-stream0-00007.mp4, init.mp4,
+// eller bare 00012.mp4. Sådan et stykke er få sekunder af filmen – ikke filmen.
+const FMP4_SEG_RE =
+  /(?:^|[/_-])(?:seg|segment|chunk|frag|fragment|init|media)[-_.]?\d*\.(?:mp4|m4v|webm)(?:$)/i;
+const NUMERIC_SEG_RE = /\/\d{1,7}\.(?:mp4|m4v|webm)$/i;
+
+// Et byte-interval af en større fil (Vimeo: /v2/range/prot/…, eller ?range=a-b)
+// er heller ikke filmen, uanset at det hedder .mp4 og fylder et par hundrede kB.
+const RANGE_URL_RE = /\/range\/|(?:^|[?&])range=\d+-\d+/i;
+
+function isSegmentFile(path, url) {
+  return FMP4_SEG_RE.test(path) || NUMERIC_SEG_RE.test(path) ||
+    RANGE_URL_RE.test(url || '');
+}
+
 function classify(url, contentType) {
   let path;
   try { path = new URL(url).pathname.toLowerCase(); } catch (_) { return null; }
   const ct = (contentType || '').toLowerCase();
   if (SEGMENT_RE.test(path)) return null;
+  // Vimeos adaptive afspiller har hverken .m3u8 eller .mpd – dens playliste er
+  // en signeret JSON. Uden den ser vi kun løsrevne byte-intervaller.
+  if (/\/v2\/playlist\//.test(path) || /\/(playlist|master)\.json$/.test(path)) {
+    return 'vimeo';
+  }
   if (path.endsWith('.m3u8') || ct.includes('mpegurl')) return 'hls';
   if (path.endsWith('.mpd') || ct.includes('dash+xml')) return 'dash';
   if (/\.(mp4|m4v|webm|mov|mkv|ogv)$/.test(path)) return 'file';
@@ -179,9 +206,12 @@ chrome.webRequest.onHeadersReceived.addListener(
     const len = (details.responseHeaders || []).find(
       (h) => h.name.toLowerCase() === 'content-length'
     );
+    let path = '';
+    try { path = new URL(details.url).pathname.toLowerCase(); } catch (_) {}
     record(details.tabId, {
       url: details.url,
       kind,
+      seg: kind === 'file' && isSegmentFile(path, details.url),
       size: len ? Number(len.value) || 0 : 0,
       ts: Date.now()
     });
@@ -208,6 +238,129 @@ async function getMedia(tabId) {
   const map = mem.get(tabId);
   if (!map) return [];
   return [...map.values()];
+}
+
+// ------------------------------------------------------------ undersøg ---
+//
+// En side kan sagtens have 30+ medie-URL'er: forhåndsvisninger på hvert
+// miniaturebillede, reklamer, lydsporet for sig. Størrelsen alene afslører
+// ikke hvilken der er *filmen* – en playliste fylder få kilobyte, uanset om
+// den beskriver 10 sekunder eller 3½ time. Derfor åbner vi playlisterne og
+// måler deres rigtige spilletid, så valget kan træffes på det.
+
+const PROBE_TIMEOUT = 8000;
+const PROBE_MAX = 24;
+
+async function probeAll(items) {
+  const out = [];
+  const queue = items.slice(0, PROBE_MAX);
+  let i = 0;
+  const workers = new Array(Math.min(4, queue.length)).fill(0).map(async () => {
+    while (i < queue.length) {
+      const item = queue[i++];
+      try {
+        out.push({ url: item.url, ...(await probeOne(item)) });
+      } catch (e) {
+        out.push({ url: item.url, err: e.message || String(e) });
+      }
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+async function probeFetch(url, init) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), PROBE_TIMEOUT);
+  try {
+    return await fetch(url, { credentials: 'include', signal: ctl.signal, ...init });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function probeOne(item) {
+  if (item.kind === 'hls') return probeHls(item.url);
+  if (item.kind === 'dash') return probeDash(item.url);
+  if (item.kind === 'vimeo') return probeVimeo(item.url);
+  return probeFile(item.url);
+}
+
+async function probeVimeo(url) {
+  const res = await probeFetch(url);
+  if (!res.ok) return { err: `HTTP ${res.status}` };
+  const data = await res.json();
+  const vids = data.video || [];
+  const best = [...vids].sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+  const notes = [`${vids.length} kvaliteter`];
+  if (best && best.height) notes.push(`bedst ${best.width}x${best.height}`);
+  if ((data.audio || []).length) notes.push('adskilt lyd');
+  return {
+    dur: (best && best.duration) || data.duration || 0,
+    note: notes.join('; ')
+  };
+}
+
+async function probeHls(url) {
+  const res = await probeFetch(url);
+  if (!res.ok) return { err: `HTTP ${res.status}` };
+  let text = await res.text();
+  const notes = [];
+
+  if (/#EXT-X-STREAM-INF/.test(text)) {
+    const variants = [];
+    const lines = text.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      if (!lines[i].startsWith('#EXT-X-STREAM-INF')) continue;
+      const bw = Number((lines[i].match(/BANDWIDTH=(\d+)/i) || [])[1] || 0);
+      const res2 = (lines[i].match(/RESOLUTION=([0-9x]+)/i) || [])[1] || '';
+      const next = (lines[i + 1] || '').trim();
+      if (next && !next.startsWith('#')) {
+        variants.push({ bw, res: res2, url: new URL(next, url).href });
+      }
+    }
+    if (!variants.length) return { note: 'master uden kvaliteter' };
+    variants.sort((a, b) => b.bw - a.bw);
+    notes.push(`master, ${variants.length} kvaliteter, bedst ${variants[0].res ||
+      Math.round(variants[0].bw / 1000) + ' kbps'}`);
+    const vres = await probeFetch(variants[0].url);
+    if (!vres.ok) return { note: notes.join('; '), err: `variant HTTP ${vres.status}` };
+    text = await vres.text();
+  }
+
+  const dur = [...text.matchAll(/#EXTINF:\s*([\d.]+)/g)]
+    .reduce((n, m) => n + (Number(m[1]) || 0), 0);
+  const segs = (text.match(/#EXTINF/g) || []).length;
+  notes.push(`${segs} segmenter`);
+  if (/#EXT-X-KEY[^\n]*METHOD=SAMPLE-AES/i.test(text)) notes.push('DRM (SAMPLE-AES)');
+  else if (/#EXT-X-KEY[^\n]*METHOD=AES-128/i.test(text)) notes.push('AES-128');
+  if (!/#EXT-X-ENDLIST/.test(text)) notes.push('live/uafsluttet');
+  return { dur, note: notes.join('; ') };
+}
+
+async function probeDash(url) {
+  const res = await probeFetch(url);
+  if (!res.ok) return { err: `HTTP ${res.status}` };
+  const text = await res.text();
+  const iso = (text.match(/mediaPresentationDuration="([^"]+)"/) || [])[1] || '';
+  const m = iso.match(/P(?:(\d+)D)?T(?:([\d.]+)H)?(?:([\d.]+)M)?(?:([\d.]+)S)?/);
+  const dur = m
+    ? (Number(m[1] || 0) * 86400) + (Number(m[2] || 0) * 3600) +
+      (Number(m[3] || 0) * 60) + Number(m[4] || 0)
+    : 0;
+  const notes = [`${(text.match(/<Representation\b/g) || []).length} kvaliteter`];
+  if (/type="dynamic"/.test(text)) notes.push('live (dynamic)');
+  if (/<ContentProtection\b/.test(text)) notes.push('DRM');
+  return { dur, note: notes.join('; ') };
+}
+
+async function probeFile(url) {
+  const res = await probeFetch(url, { method: 'HEAD' });
+  if (!res.ok) return { err: `HTTP ${res.status}` };
+  return {
+    size: Number(res.headers.get('content-length')) || 0,
+    note: res.headers.get('content-type') || ''
+  };
 }
 
 // Ryd listen når fanen navigerer til en ny side eller lukkes.
@@ -268,10 +421,12 @@ async function downloadMedia(msg, tabId) {
     ? chrome.storage.local.set({ [SEQ_KEY]: seq.next + 1 }).catch(() => {})
     : Promise.resolve();
 
-  if (kind === 'hls' || kind === 'dash') {
+  if (kind === 'hls' || kind === 'dash' || kind === 'vimeo') {
     relay(tabId, { type: 'MEDIA_PROGRESS', text: 'Læser playliste…' });
     const res = await runInOffscreen({
-      type: kind === 'hls' ? 'OFFSCREEN_HLS' : 'OFFSCREEN_DASH', url, tabId
+      type: kind === 'hls' ? 'OFFSCREEN_HLS'
+        : kind === 'dash' ? 'OFFSCREEN_DASH' : 'OFFSCREEN_VIMEO',
+      url, tabId
     });
     if (!res || !res.ok) throw new Error((res && res.error) || 'Kunne ikke samle videoen');
 

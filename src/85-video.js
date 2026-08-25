@@ -24,13 +24,19 @@
     const vSelect = document.createElement('select');
     Object.assign(vSelect.style, {
       padding: '6px 8px', borderRadius: '8px', border: 'none',
-      font: '13px system-ui, sans-serif', maxWidth: '320px', display: 'none'
+      font: '13px system-ui, sans-serif', maxWidth: '420px', display: 'none'
     });
+    // Sidens egen CSS rammer også vores select. Farverne sættes med !important,
+    // så en mørk side ikke efterlader hvid tekst på hvid baggrund = tom liste.
+    vSelect.style.setProperty('color', '#111827', 'important');
+    vSelect.style.setProperty('background', '#fff', 'important');
 
     const btnGet = WF.ui.mkBtn('⬇ Hent video');
     btnGet.style.background = '#2563eb';
+    const btnProbe = WF.ui.mkBtn('🔎 Kilder');
+    btnProbe.title = 'Undersøg alle kilder og kopiér rapporten';
     const btnCancel = WF.ui.mkBtn('✕');
-    vToolbar.append(vStatus, vSelect, btnGet, btnCancel);
+    vToolbar.append(vStatus, vSelect, btnProbe, btnGet, btnCancel);
 
     function setBusy(msg) {
       vStatus.textContent = msg;
@@ -74,11 +80,33 @@
     // Kilder som baggrunds-workeren har set fanen hente (fanger blob:-afspillere).
     async function sniffedSources() {
       try {
-        const list = await chrome.runtime.sendMessage({ type: 'GET_MEDIA' }) || [];
-        return list.sort((a, b) => (b.size - a.size) || (b.ts - a.ts));
+        return await chrome.runtime.sendMessage({ type: 'GET_MEDIA' }) || [];
       } catch (_) {
         return [];
       }
+    }
+
+    // Rækkefølgen kan ikke afgøres på størrelsen. En playliste på 3½ time fylder
+    // få kilobyte, mens et enkelt fMP4-segment eller en forhåndsvisning fra et
+    // miniaturebillede sagtens fylder megabyte – så størrelse alene lægger
+    // stumperne øverst og filmen nederst. Derfor: playlister først, dernæst hele
+    // filer, og segmenter sidst. Kender vi spilletiden (🔎/auto-undersøgelse),
+    // vejer den tungest af alt: den længste er filmen.
+    const PLAYLIST_KINDS = ['hls', 'dash', 'vimeo'];
+
+    function rank(c) {
+      if (c.seg) return 3;
+      if (PLAYLIST_KINDS.includes(c.kind)) return 0;
+      return 1;
+    }
+
+    function sortCands(list) {
+      return list.sort((a, b) =>
+        (rank(a) - rank(b)) ||
+        ((b.dur || 0) - (a.dur || 0)) ||
+        ((b.size || 0) - (a.size || 0)) ||
+        ((b.ts || 0) - (a.ts || 0))
+      );
     }
 
     async function findCandidates(container) {
@@ -93,17 +121,27 @@
         add({ url: u, kind: /\.m3u8(\?|$)/i.test(u) ? 'hls' : 'file', size: 0 });
       });
       (await sniffedSources()).forEach(add);
-      return cands;
+      return sortCands(cands);
     }
 
     const fmtSize = (n) => !n ? '' :
       n > 1048576 ? ` (${Math.round(n / 1048576)} MB)` : ` (${Math.round(n / 1024)} kB)`;
 
+    function fmtDur(s) {
+      if (!s) return '';
+      const t = Math.round(s);
+      const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), sec = t % 60;
+      const two = (n) => String(n).padStart(2, '0');
+      return h ? `${h}:${two(m)}:${two(sec)}` : `${m}:${two(sec)}`;
+    }
+
     function labelFor(c) {
       let name = c.url;
       try { name = new URL(c.url).pathname.split('/').pop() || c.url; } catch (_) {}
-      const kind = c.kind === 'hls' ? 'stream' : c.kind === 'dash' ? 'DASH' : 'fil';
-      return `${name.slice(0, 48)} – ${kind}${fmtSize(c.size)}`;
+      const kind = c.kind === 'hls' ? 'stream' : c.kind === 'dash' ? 'DASH'
+        : c.kind === 'vimeo' ? 'Vimeo' : c.seg ? 'stump' : 'fil';
+      const dur = c.dur ? ` ⏱ ${fmtDur(c.dur)}` : '';
+      return `${name.slice(0, 48)} – ${kind}${dur}${fmtSize(c.size)}`;
     }
 
     function showCandidates(cands) {
@@ -120,8 +158,15 @@
         vSelect.appendChild(o);
       });
       vSelect.style.display = cands.length > 1 ? 'block' : 'none';
+      // Fandt vi kun byte-intervaller, er playlisten hentet før Webfang lyttede
+      // med. Uden den er der intet at hente hele filmen ud fra.
+      if (cands.every((c) => c.seg)) {
+        setError('Kun stumper fundet – genindlæs siden (F5), start afspilningen, prøv igen');
+        return;
+      }
       vStatus.textContent = cands.length > 1
-        ? `${cands.length} kilder fundet:` : 'Kilde fundet:';
+        ? `${cands.length} kilder${probed ? ' – længste øverst' : ''}:`
+        : 'Kilde fundet:';
       btnGet.disabled = false;
       btnGet.style.opacity = '1';
     }
@@ -145,6 +190,79 @@
       setBusy('Leder efter video-kilden…');
       s.vidCands = await findCandidates(container);
       showCandidates(s.vidCands);
+      // Playlisterne måles bagefter, så listen ikke venter på netværket: når
+      // spilletiderne er hjemme, ordner listen sig selv med filmen øverst.
+      if (s.vidCands.some((c) => PLAYLIST_KINDS.includes(c.kind))) {
+        probe(true).catch(() => {});
+      }
+    }
+
+    // ---- Undersøgelse af kilderne ------------------------------------------
+
+    let probed = false;
+
+    async function probe(quiet) {
+      const s = WF.state;
+      const cands = s.vidCands || [];
+      if (!cands.length) return [];
+      const keep = vSelect.value;
+      if (!quiet) vStatus.textContent = 'Undersøger kilder…';
+      const results = await chrome.runtime.sendMessage({
+        type: 'PROBE_MEDIA',
+        items: cands.map((c) => ({ url: c.url, kind: c.kind }))
+      }) || [];
+      if (s.phase !== 'vselected') return results;
+      const byUrl = new Map(results.map((r) => [r.url, r]));
+      cands.forEach((c) => {
+        const r = byUrl.get(c.url);
+        if (!r) return;
+        if (r.dur) c.dur = r.dur;
+        if (r.size && !c.size) c.size = r.size;
+        if (r.note) c.note = r.note;
+        if (r.err) c.err = r.err;
+      });
+      const wasSel = cands[Number(keep) || 0];
+      sortCands(cands);
+      probed = true;
+      showCandidates(cands);
+      // Har brugeren selv valgt en kilde, følger valget med efter omsorteringen.
+      if (wasSel && keep) {
+        const i = cands.indexOf(wasSel);
+        if (i >= 0) vSelect.value = String(i);
+      }
+      return results;
+    }
+
+    function report(cands) {
+      const lines = [
+        `Webfang video-kilder – ${location.href}`,
+        `${cands.length} kilder, sorteret som i listen`, ''
+      ];
+      cands.forEach((c, i) => {
+        lines.push(`${i + 1}. [${c.kind}${c.seg ? '/stump' : ''}] ` +
+          `${c.dur ? fmtDur(c.dur) : 'ukendt længde'}${fmtSize(c.size)}`);
+        if (c.note) lines.push(`   ${c.note}`);
+        if (c.err) lines.push(`   FEJL: ${c.err}`);
+        lines.push(`   ${c.url}`);
+      });
+      return lines.join('\n');
+    }
+
+    async function probeAndReport() {
+      const s = WF.state;
+      try {
+        if (!probed) await probe(false);
+        const text = report(s.vidCands || []);
+        try {
+          await navigator.clipboard.writeText(text);
+          WF.ui.toast('Kilde-rapport kopieret ✓ – indsæt med Ctrl+V', 4000);
+        } catch (_) {
+          console.log('[Webfang] kilder:\n' + text);
+          WF.ui.toast('Kunne ikke kopiere – rapporten står i konsollen (F12)', 5000);
+        }
+      } catch (e) {
+        setError('Fejl: ' + (e.message || e));
+      }
     }
 
     async function download() {
@@ -176,6 +294,7 @@
     }
 
     btnGet.onclick = download;
+    btnProbe.onclick = probeAndReport;
     btnCancel.onclick = () => teardown();
 
     // ---- Livscyklus ---------------------------------------------------------
@@ -197,6 +316,7 @@
       if (s.phase !== 'idle') return;
       s.phase = 'vhover';
       s.vidCands = [];
+      probed = false;
       document.documentElement.append(WF.ui.overlay, vToolbar);
       vToolbar.style.display = 'none';
       document.addEventListener('mousemove', onMove, true);
@@ -210,6 +330,7 @@
       s.phase = 'idle';
       s.currentEl = null;
       s.vidCands = [];
+      probed = false;
       document.removeEventListener('mousemove', onMove, true);
       document.removeEventListener('click', onClick, true);
       WF.app.unlistenGlobal();

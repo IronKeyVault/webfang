@@ -4,13 +4,21 @@
 // Bemærk: kun ubeskyttede streams. Er streamen DRM-beskyttet (Widevine/
 // FairPlay/SAMPLE-AES) stopper vi med en klar fejl – Webfang bryder ikke DRM.
 
-const CONCURRENCY = 5;
+// Hvor mange segmenter der hentes ad gangen. Det er den eneste knap vi selv
+// har på hastigheden: resten sætter CDN'en, din linje og rundturstiden pr.
+// forespørgsel. Hvert segment er sin egen HTTP-forespørgsel, så ved små
+// segmenter er ventetiden på svar — ikke båndbredden — det der koster.
+// Højere tal er ikke gratis: serveren kan begynde at afvise (429), og alle
+// igangværende segmenter ligger i hukommelsen samtidig.
+const CONCURRENCY = 8;
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg) return;
 
-  if (msg.type === 'OFFSCREEN_HLS' || msg.type === 'OFFSCREEN_DASH') {
-    const build = msg.type === 'OFFSCREEN_HLS' ? buildHls : buildDash;
+  if (msg.type === 'OFFSCREEN_HLS' || msg.type === 'OFFSCREEN_DASH' ||
+      msg.type === 'OFFSCREEN_VIMEO') {
+    const build = msg.type === 'OFFSCREEN_HLS' ? buildHls
+      : msg.type === 'OFFSCREEN_DASH' ? buildDash : buildVimeo;
     build(msg.url, msg.tabId)
       .then(sendResponse)
       .catch((e) => sendResponse({ ok: false, error: e.message || String(e) }));
@@ -35,13 +43,32 @@ async function fetchText(url) {
   return res.text();
 }
 
-// Tæller fremdrift på tværs af alle segmenter i en download.
+// Tæller fremdrift på tværs af alle segmenter i en download — med fart og resttid. Uden dem er en lang hentning bare et tal der
+// kryber, og man kan hverken se om den er gået i stå eller om det kan betale
+// sig at skrue på CONCURRENCY.
 function makeTicker(tabId, total) {
   let done = 0;
-  return () => {
+  let bytes = 0;
+  const started = Date.now();
+  return (n = 0) => {
     done++;
-    if (done % 5 === 0 || done === total) progress(tabId, `Henter video… ${done}/${total}`);
+    bytes += n;
+    if (done % 5 !== 0 && done !== total) return;
+    const secs = (Date.now() - started) / 1000;
+    const parts = [`Henter video… ${done}/${total}`];
+    if (secs > 1 && bytes) parts.push(`${fmtNum(bytes / 1048576 / secs)} MB/s`);
+    if (secs > 3 && done < total) parts.push(`~${fmtTime(secs * (total - done) / done)} tilbage`);
+    progress(tabId, parts.join(' · '));
   };
+}
+
+const fmtNum = (n) => n.toFixed(1).replace('.', ',');
+
+function fmtTime(secs) {
+  if (secs < 90) return `${Math.round(secs)} sek`;
+  const min = Math.round(secs / 60);
+  if (min < 60) return `${min} min`;
+  return `${Math.floor(min / 60)} t ${min % 60} min`;
 }
 
 // ---- HLS ------------------------------------------------------------------
@@ -71,13 +98,13 @@ async function buildHls(url, tabId) {
   await pool(pl.segments, CONCURRENCY, async (seg, i) => {
     const buf = await fetchRange(seg.url, seg.byterange);
     parts[i] = seg.key ? await decrypt(buf, seg, keyCache) : new Uint8Array(buf);
-    tick();
+    tick(buf.byteLength);
   });
 
   if (pl.map) {
     // fMP4: init-segmentet forrest, så er filen en færdig .mp4.
     const initBuf = await fetchRange(pl.map.url, pl.map.byterange);
-    tick();
+    tick(initBuf.byteLength);
     return { ok: true, files: [makeFile([new Uint8Array(initBuf), ...parts], 'mp4')] };
   }
 
@@ -90,17 +117,24 @@ async function buildHls(url, tabId) {
 async function buildDash(url, tabId) {
   progress(tabId, 'Læser .mpd-filen…');
   const { streams } = parseMpd(await fetchText(url), url);
+  return assembleStreams(streams, tabId);
+}
 
+// Samler et sæt streams (video + evt. adskilt lyd) til færdige filer. Delt
+// mellem DASH og Vimeo, fordi begge leverer det samme: en liste af segmenter
+// pr. spor, med et init-segment foran.
+async function assembleStreams(streams, tabId) {
   const total = streams.reduce((n, s) => n + s.segments.length + (s.init ? 1 : 0), 0);
   const tick = makeTicker(tabId, total);
-  const files = [];
+  const built = [];
+  let muxNote = '';
 
   for (const s of streams) {
     // Ligger hele streamen i én fil, henter vi den bare som den er.
     if (s.single) {
       const buf = await fetchRange(s.segments[0].url, s.segments[0].byterange);
-      tick();
-      files.push(makeFile([new Uint8Array(buf)], 'mp4', suffixFor(streams, s)));
+      tick(buf.byteLength);
+      built.push({ kind: s.kind, parts: [new Uint8Array(buf)] });
       continue;
     }
 
@@ -108,34 +142,120 @@ async function buildDash(url, tabId) {
     await pool(s.segments, CONCURRENCY, async (seg, i) => {
       const buf = await fetchRange(seg.url, seg.byterange);
       parts[i] = new Uint8Array(buf);
-      tick();
+      tick(buf.byteLength);
     });
 
     const blobParts = [];
-    if (s.init) {
+    if (s.init && s.init.data) {
+      // Vimeo leverer init-segmentet i selve playlisten (base64), ikke som URL.
+      blobParts.push(s.init.data);
+      tick(s.init.data.length);
+    } else if (s.init) {
       const initBuf = await fetchRange(s.init.url, s.init.byterange);
-      tick();
+      tick(initBuf.byteLength);
       blobParts.push(new Uint8Array(initBuf));
     }
     blobParts.push(...parts);
 
-    // DASH-segmenter er fMP4; lyd alene gemmes som .m4a.
-    const ext = s.kind === 'audio' && streams.length > 1 ? 'm4a' : 'mp4';
-    files.push(makeFile(blobParts, ext, suffixFor(streams, s)));
+    built.push({ kind: s.kind, parts: blobParts });
   }
+
+  // Kom lyden for sig, lægges de to spor sammen til én fil. Det er ren
+  // ompakning – se mp4-mux.js. Går det galt, er to spilbare filer stadig
+  // bedre end ingen, så vi falder tilbage til dem og siger hvorfor.
+  const video = built.find((b) => b.kind !== 'audio');
+  const audio = built.find((b) => b.kind === 'audio');
+  if (built.length === 2 && video && audio && self.__wfMux) {
+    try {
+      progress(tabId, 'Lægger video og lyd sammen…');
+      const merged = self.__wfMux.mux(video.parts, audio.parts);
+      return { ok: true, files: [makeFile(merged, 'mp4')], note: '' };
+    } catch (e) {
+      muxNote = `lyden ligger for sig (kunne ikke samles: ${e.message || e})`;
+    }
+  }
+
+  const files = built.map((b) => makeFile(
+    b.parts,
+    b.kind === 'audio' && built.length > 1 ? 'm4a' : 'mp4',
+    built.length > 1 ? (b.kind === 'audio' ? ' (lyd)' : ' (video)') : ''
+  ));
 
   return {
     ok: true,
     files,
     // Er lyden en separat fil, skal brugeren have det at vide.
-    note: files.length > 1 ? 'video og lyd kom som to filer' : ''
+    note: files.length > 1 ? (muxNote || 'video og lyd kom som to filer') : ''
   };
 }
 
-// Navne-tilføjelse når en stream bliver til flere filer.
-function suffixFor(streams, s) {
-  if (streams.length < 2) return '';
-  return s.kind === 'audio' ? ' (lyd)' : ' (video)';
+// ---- Vimeo ----------------------------------------------------------------
+//
+// Vimeos adaptive afspiller bruger hverken .m3u8 eller .mpd, men en signeret
+// JSON-playliste. Hvert spor er én mp4-fil skåret i byte-intervaller, og hvert
+// interval har sin egen signatur i stien (`range/prot/<base64>/…&pathsig=…`).
+// Derfor kan man ikke selv bede om hele filen: URL'en til den findes ikke.
+// Det eneste sted alle intervallerne står samlet, er playlisten – så den er
+// nøglen til at få hele videoen i stedet for de få sekunder afspilleren lige
+// havde hentet, da man trykkede.
+
+async function buildVimeo(url, tabId) {
+  progress(tabId, 'Læser Vimeo-playlisten…');
+  const res = await fetch(url, { credentials: 'include' });
+  if (!res.ok) throw new Error(`HTTP ${res.status} på Vimeo-playlisten`);
+  const data = await res.json();
+
+  const streams = parseVimeo(data, url);
+  if (!streams.length) throw new Error('Ingen spor i Vimeo-playlisten');
+  return assembleStreams(streams, tabId);
+}
+
+function parseVimeo(data, playlistUrl) {
+  // base_url'erne er relative og lægges oven på hinanden: playlist → sæt → spor.
+  const setBase = new URL(data.base_url || '.', playlistUrl).href;
+  const streams = [];
+
+  const pick = (list, kind) => {
+    if (!Array.isArray(list) || !list.length) return;
+    // Højeste kvalitet: opløsning for video, bitrate for lyd.
+    const best = [...list].sort((a, b) =>
+      ((b.height || 0) * (b.width || 0) - (a.height || 0) * (a.width || 0)) ||
+      ((b.bitrate || 0) - (a.bitrate || 0))
+    )[0];
+    const base = new URL(best.base_url || '.', setBase).href;
+    const segs = (best.segments || []).map((s) => ({
+      url: new URL(s.url, base).href,
+      byterange: null
+    }));
+    if (!segs.length) return;
+    streams.push({
+      kind,
+      init: initOf(best, base),
+      segments: segs,
+      duration: best.duration || 0
+    });
+  };
+
+  pick(data.video, 'video');
+  pick(data.audio, 'audio');
+  return streams;
+}
+
+// init_segment er enten base64-data direkte i playlisten eller en URL til det.
+function initOf(rep, base) {
+  const s = rep.init_segment;
+  if (!s) return null;
+  if (/^[A-Za-z0-9+/=\s]+$/.test(s) && s.length > 64 && !/\.(mp4|m4s)$/i.test(s)) {
+    return { data: b64ToBytes(s) };
+  }
+  return { url: new URL(s, base).href, byterange: null };
+}
+
+function b64ToBytes(b64) {
+  const bin = atob(b64.replace(/\s+/g, ''));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
 }
 
 // ---- TS → MP4 -------------------------------------------------------------
