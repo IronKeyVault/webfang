@@ -12,6 +12,8 @@ const html = `<!doctype html><html><body>
 <main>
   <h1>Overskrift</h1>
   <p>Første afsnit med noget tekst der er lang nok til at tælle med i optaget.</p>
+  <h2>Underoverskrift</h2>
+  <h4>Dybere overskrift</h4>
   <a href="/tilbage">Return to Course</a>
   <img src="/billede.png" alt="et billede">
   <p><a href="https://eksempel.dk/side">Et rigtigt link</a> midt i teksten.</p>
@@ -104,6 +106,12 @@ for (const f of files) {
   const check = (navn, ok) => console.log((ok ? '  ok  ' : ' FEJL ') + navn);
   check('overskrift med', /Overskrift/.test(out));
   check('brødtekst med', /Første afsnit/.test(out));
+  // Sidens titel er et <h1>; det niveau hører til dokumentets egen titel i
+  // Word/OneNote, så klippet starter på 2 og lægger resten på 3.
+  check('titel blev overskrift 2', /<h2[^>]*>Overskrift<\/h2>/.test(out));
+  check('underoverskrifter blev overskrift 3',
+    /<h3[^>]*>Underoverskrift<\/h3>/.test(out) && /<h3[^>]*>Dybere overskrift<\/h3>/.test(out));
+  check('ingen h1 tilbage', !/<h1/i.test(out));
   check('nav-link fjernet', !/Return to Course/.test(out));
   check('menu fjernet', !/>Menu</.test(out));
   check('rigtigt link bevaret', /eksempel\.dk\/side/.test(out));

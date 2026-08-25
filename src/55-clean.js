@@ -273,6 +273,23 @@
       while (isBareLink(root.lastElementChild)) root.lastElementChild.remove();
     }
 
+    // 16) Overskrifts-niveauer ned. Sidens egen titel er et <h1>, og i Word/
+    //     OneNote bliver den til Overskrift 1 – det niveau hører til
+    //     dokumentets/sidens egen titel, ikke til et indklippet afsnit.
+    //     Derfor: <h1> → <h2>, og alt andet under den (h2-h6) → <h3>, så et
+    //     klip altid får samme to niveauer uanset hvor dybt siden selv nummer-
+    //     erede. Attributter og indhold følger med; kun tag-navnet skifter.
+    function demoteHeadings(root) {
+      root.querySelectorAll('h1, h2, h3, h4, h5, h6').forEach((h) => {
+        const want = h.tagName === 'H1' ? 'h2' : 'h3';
+        if (h.tagName.toLowerCase() === want) return;
+        const el = document.createElement(want);
+        [...h.attributes].forEach((a) => el.setAttribute(a.name, a.value));
+        while (h.firstChild) el.appendChild(h.firstChild);
+        h.replaceWith(el);
+      });
+    }
+
     function absolutize(root) {
       root.querySelectorAll('a[href]').forEach((a) => {
         const abs = WF.util.absUrl(a.getAttribute('href'));
@@ -310,6 +327,9 @@
       ['kode-linjeskift', (root, ctx) => keepPreformatted(root, ctx.liveOf)],
       ['tomme wrappers', (root) => dropEmptyWrappers(root)],
       ['løse links i kanten', (root) => trimBareLinks(root)],
+      // Efter trimBareLinks, som bruger h1-h6 til at kende titlen fra et løst
+      // link – niveauerne skal først skifte når den har set dem.
+      ['overskrifts-niveauer', (root) => demoteHeadings(root)],
       // Mærket har gjort sit; det skal ikke med i klippet. (data-wf-frame og
       // data-wf-iframe er noget andet – de opløses senere i optaget.)
       ['ryd mærker', (root) => {

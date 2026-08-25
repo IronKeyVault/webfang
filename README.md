@@ -103,6 +103,11 @@ stadig den gamle udgave af udvidelsens script.
   Ligger afspilleren i sin egen container ved siden af teksten (Cisco U.: video
   øverst, artikel nedenunder), bliver den hentet ind øverst i klippet alligevel,
   så man ikke skal ramme begge dele med rammen.
+- **Overskrifter sættes et niveau ned.** Sidens titel er et `<h1>`, og det blev
+  til Overskrift 1 i Word/OneNote — det niveau hører til dokumentets egen titel,
+  ikke til et indklippet afsnit. Derfor bliver `<h1>` til Overskrift 2, og alle
+  øvrige overskrifter (`h2`–`h6`) til Overskrift 3, så et klip altid har de
+  samme to niveauer uanset hvor dybt siden selv nummererede.
 - **Tabeller** bliver til rigtige `<table>`. Mange sider bygger tabeller af
   div'er med CSS-grid eller ARIA-roller, og dem ser Word kun som løs tekst under
   hinanden. De bygges om til en tabel med streger og fed overskriftsrække — også
