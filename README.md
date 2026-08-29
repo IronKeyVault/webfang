@@ -43,6 +43,31 @@ rammen, og valget er igen ét element.
 Finder den ingenting, så start afspilningen et par sekunder og prøv igen —
 streaming-afspillere afslører først deres rigtige URL når de begynder at hente.
 
+### Når CDN'en svarer 403
+
+Nogle streaming-tjenester (Hotmart, som bl.a. Teachable-kurser bruger, og
+lignende Akamai-signerede opsætninger) udleverer kun videoen til en
+forespørgsel der ligner afspillerens egen: rigtig `Origin`, rigtig `Referer`,
+sidens cookies. Webfangs eget baggrunds-dokument er sin egen oprindelse og har
+ingen af delene — så CDN'en svarede 403, selv om afspilleren i rammen ved siden
+af hentede den samme URL uden problemer. `🔎 Kilder` viste `FEJL: HTTP 403` på
+hver eneste kilde.
+
+Løsningen er ikke at gætte hvilke headere der mangler, men at flytte selve
+hentningen: Webfang beder den **ramme hvor afspilleren bor** om at hente
+playlisten og segmenterne. Så er afsenderen siden selv, og browseren sætter
+det hele rigtigt uden at vi skal kende opskriften.
+
+Det sker automatisk og kun når det er nødvendigt — den direkte vej prøves
+først, og først når den bliver afvist, går Webfang om ad siden. Går ét kald på
+en vært den vej, gør resten af segmenterne det samme med det samme, så en lang
+video ikke bruger en spildt forespørgsel pr. segment.
+
+To ting det **ikke** kan: DRM-beskyttede streams (dem rører Webfang ikke), og
+en video hvis adgangsbillet allerede er udløbet — billetterne i URL'en har et
+tidsstempel, og et par af dem lever kun minutter. Hjælper det ikke, så
+genindlæs siden (F5), start afspilningen, og prøv igen med det samme.
+
 ### Fortløbende nummer
 
 Filerne får sidens egen titel som navn med et løbenummer foran, fx

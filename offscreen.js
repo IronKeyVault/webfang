@@ -19,6 +19,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       msg.type === 'OFFSCREEN_VIMEO') {
     const build = msg.type === 'OFFSCREEN_HLS' ? buildHls
       : msg.type === 'OFFSCREEN_DASH' ? buildDash : buildVimeo;
+    startBuild(msg);
     build(msg.url, msg.tabId)
       .then(sendResponse)
       .catch((e) => sendResponse({ ok: false, error: e.message || String(e) }));
@@ -41,6 +42,75 @@ async function fetchText(url) {
   const res = await fetch(url, { credentials: 'include' });
   if (!res.ok) throw new Error(`HTTP ${res.status} på playlisten`);
   return res.text();
+}
+
+// ---- Hent via siden -------------------------------------------------------
+//
+// Et signeret CDN udleverer kun streamen til en forespørgsel der ligner
+// afspillerens: rigtig `Origin`, rigtig `Referer`, sidens cookies. Dette
+// dokument har sin egen oprindelse og ingen af delene, så nogle CDN'er svarer
+// 403 på alt vi selv beder om – også playlister der er gyldige nok.
+//
+// Vejen udenom er at lade afspillerens EGEN ramme hente (src/15-fetch.js).
+// Den ligger her for sig selv: de direkte fetchText/fetchRange ovenfor er
+// stadig den normale vej, og træder man ikke ved siden af, mærker man ikke at
+// den her findes.
+
+let ctx = { tabId: 0, frameId: 0 };
+
+// Sider hvor den direkte vej allerede er faldet. Så snart ét kald er blevet
+// afvist, går resten af segmenterne direkte til siden – ellers ville hvert
+// eneste segment koste en spildt forespørgsel først.
+const pageFirst = new Set();
+
+function startBuild(msg) {
+  ctx = { tabId: msg.tabId || 0, frameId: msg.frameId || 0 };
+  pageFirst.clear();
+}
+
+function hostOf(url) {
+  try { return new URL(url).host; } catch (_) { return ''; }
+}
+
+async function pageGet(url, range, wantBytes) {
+  const res = await chrome.runtime.sendMessage({
+    type: 'PAGE_FETCH',
+    tabId: ctx.tabId,
+    frameId: ctx.frameId,
+    req: { url, range, wantBytes }
+  });
+  if (!res || !res.ok) {
+    throw new Error((res && res.error) || 'siden kunne ikke hente den');
+  }
+  return res;
+}
+
+// De to smarte varianter: direkte først, siden bagefter. Kender vi ingen fane
+// (kaldt uden for et optag), er der kun den direkte vej, og fejlen står som den
+// er – så ligner den sig selv i stedet for at blive pakket ind.
+async function fetchTextSmart(url) {
+  const host = hostOf(url);
+  if (!pageFirst.has(host)) {
+    try { return await fetchText(url); } catch (e) { if (!ctx.tabId) throw e; }
+  }
+  const res = await pageGet(url, null, false);
+  pageFirst.add(host);
+  return res.text;
+}
+
+async function fetchRangeSmart(url, byterange) {
+  const host = hostOf(url);
+  if (!pageFirst.has(host)) {
+    try { return await fetchRange(url, byterange); } catch (e) { if (!ctx.tabId) throw e; }
+  }
+  let range = null;
+  if (byterange) {
+    const start = byterange.offset || 0;
+    range = `bytes=${start}-${start + byterange.length - 1}`;
+  }
+  const res = await pageGet(url, range, true);
+  pageFirst.add(host);
+  return b64ToBytes(res.b64).buffer;
 }
 
 // Tæller fremdrift på tværs af alle segmenter i en download — med fart og resttid. Uden dem er en lang hentning bare et tal der
@@ -74,7 +144,7 @@ function fmtTime(secs) {
 // ---- HLS ------------------------------------------------------------------
 
 async function buildHls(url, tabId) {
-  let text = await fetchText(url);
+  let text = await fetchTextSmart(url);
   let playlistUrl = url;
 
   // Master-playliste? Vælg varianten med højest bitrate (= bedste kvalitet).
@@ -85,7 +155,7 @@ async function buildHls(url, tabId) {
     const best = variants[0];
     progress(tabId, `Vælger ${best.resolution || Math.round(best.bandwidth / 1000) + ' kbps'}…`);
     playlistUrl = best.url;
-    text = await fetchText(playlistUrl);
+    text = await fetchTextSmart(playlistUrl);
   }
 
   const pl = parseMedia(text, playlistUrl);
@@ -96,27 +166,28 @@ async function buildHls(url, tabId) {
   const keyCache = new Map();
 
   await pool(pl.segments, CONCURRENCY, async (seg, i) => {
-    const buf = await fetchRange(seg.url, seg.byterange);
+    const buf = await fetchRangeSmart(seg.url, seg.byterange);
     parts[i] = seg.key ? await decrypt(buf, seg, keyCache) : new Uint8Array(buf);
     tick(buf.byteLength);
   });
 
   if (pl.map) {
     // fMP4: init-segmentet forrest, så er filen en færdig .mp4.
-    const initBuf = await fetchRange(pl.map.url, pl.map.byterange);
+    const initBuf = await fetchRangeSmart(pl.map.url, pl.map.byterange);
     tick(initBuf.byteLength);
     return { ok: true, files: [makeFile([new Uint8Array(initBuf), ...parts], 'mp4')] };
   }
 
   // MPEG-TS: skal remuxes for at blive en .mp4 (se remuxTs).
-  return { ok: true, files: [await tsToMp4(parts, tabId)] };
+  const file = await tsToMp4(parts, tabId);
+  return { ok: true, files: [file], note: file.note || '' };
 }
 
 // ---- DASH -----------------------------------------------------------------
 
 async function buildDash(url, tabId) {
   progress(tabId, 'Læser .mpd-filen…');
-  const { streams } = parseMpd(await fetchText(url), url);
+  const { streams } = parseMpd(await fetchTextSmart(url), url);
   return assembleStreams(streams, tabId);
 }
 
@@ -132,7 +203,7 @@ async function assembleStreams(streams, tabId) {
   for (const s of streams) {
     // Ligger hele streamen i én fil, henter vi den bare som den er.
     if (s.single) {
-      const buf = await fetchRange(s.segments[0].url, s.segments[0].byterange);
+      const buf = await fetchRangeSmart(s.segments[0].url, s.segments[0].byterange);
       tick(buf.byteLength);
       built.push({ kind: s.kind, parts: [new Uint8Array(buf)] });
       continue;
@@ -140,7 +211,7 @@ async function assembleStreams(streams, tabId) {
 
     const parts = new Array(s.segments.length);
     await pool(s.segments, CONCURRENCY, async (seg, i) => {
-      const buf = await fetchRange(seg.url, seg.byterange);
+      const buf = await fetchRangeSmart(seg.url, seg.byterange);
       parts[i] = new Uint8Array(buf);
       tick(buf.byteLength);
     });
@@ -151,7 +222,7 @@ async function assembleStreams(streams, tabId) {
       blobParts.push(s.init.data);
       tick(s.init.data.length);
     } else if (s.init) {
-      const initBuf = await fetchRange(s.init.url, s.init.byterange);
+      const initBuf = await fetchRangeSmart(s.init.url, s.init.byterange);
       tick(initBuf.byteLength);
       blobParts.push(new Uint8Array(initBuf));
     }
@@ -201,9 +272,7 @@ async function assembleStreams(streams, tabId) {
 
 async function buildVimeo(url, tabId) {
   progress(tabId, 'Læser Vimeo-playlisten…');
-  const res = await fetch(url, { credentials: 'include' });
-  if (!res.ok) throw new Error(`HTTP ${res.status} på Vimeo-playlisten`);
-  const data = await res.json();
+  const data = JSON.parse(await fetchTextSmart(url));
 
   const streams = parseVimeo(data, url);
   if (!streams.length) throw new Error('Ingen spor i Vimeo-playlisten');
@@ -265,34 +334,95 @@ function b64ToBytes(b64) {
 async function tsToMp4(parts, tabId) {
   progress(tabId, 'Konverterer til MP4…');
   try {
-    const out = await remuxTs(parts);
+    const tracks = await remuxTs(parts);
+    const out = joinTracks(tracks);
     if (!out.length) throw new Error('tom uddata');
+    // mux.js mærker alle varigheder "ukendt" (den er lavet til MSE, hvor
+    // afspilleren får dem gennem JavaScript). I en fil på disken skal de stå
+    // i filen selv – se mp4-duration.js.
+    if (self.__wfDuration) self.__wfDuration.stamp(out);
     return makeFile(out, 'mp4');
   } catch (e) {
-    // Hellere en .ts der kan afspilles i VLC end ingen fil.
+    // Hellere en .ts der kan afspilles i VLC end ingen fil. Men GRUNDEN skal
+    // med tilbage: en tavs fallback her skjulte i sin tid at ompakningen slet
+    // ikke kunne starte, og alle TS-streams landede som .ts uden at nogen
+    // opdagede hvorfor.
     progress(tabId, 'Kunne ikke konvertere – gemmer som .ts');
-    return makeFile(parts, 'ts');
+    const file = makeFile(parts, 'ts');
+    file.note = `kunne ikke pakkes om til MP4 (${e.message || e}) – gemt som .ts`;
+    return file;
   }
 }
 
+// mux.js udgives i to snit: den fulde bundle lægger værktøjerne under
+// `muxjs.mp4`, mens den slanke mp4-bundle – den vi vendorer – eksporterer dem
+// direkte på `muxjs`. Slå op begge steder, så et skift af bundle ikke lydløst
+// slår TS→MP4 fra igen. Findes den ikke, siger vi det højt i stedet for at
+// lade en TypeError blive fanget som "remux fejlede".
+function muxTransmuxer() {
+  const m = (typeof muxjs !== 'undefined' && muxjs) || {};
+  const T = (m.mp4 && m.mp4.Transmuxer) || m.Transmuxer;
+  if (!T) throw new Error('mux.js er ikke indlæst – ingen Transmuxer fundet');
+  return T;
+}
+
+// Demuxer TS-strømmen og giver sporene TILBAGE HVER FOR SIG, som færdige
+// fMP4-strømme: { video: [...], audio: [...] }.
+//
+// `remux: false` er det vigtige. Med `true` klistrer mux.js selv sporene
+// sammen – men den kan kun skrive ét spor pr. moof, så resultatet bliver
+// skiftende ét-spors-fragmenter: 6 sekunder lyd, 6 sekunder video, 6 sekunder
+// lyd. En afspiller der læser fragmenterne i rækkefølge (VLC) spiller dem
+// præcis sådan, og så er der huller i begge dele. Holder vi i stedet sporene
+// adskilt, kan vores egen muxer flette dem rigtigt – se joinTracks.
 function remuxTs(parts) {
   return new Promise((resolve, reject) => {
-    const tm = new muxjs.mp4.Transmuxer({ remux: true });
-    const out = [];
-    let haveInit = false;
+    const Transmuxer = muxTransmuxer();
+    const tm = new Transmuxer({ remux: false });
+    const tracks = Object.create(null);
     tm.on('data', (seg) => {
-      if (!haveInit && seg.initSegment) { out.push(seg.initSegment); haveInit = true; }
-      out.push(seg.data);
+      const kind = seg.type || 'combined';
+      const list = tracks[kind] || (tracks[kind] = []);
+      // Init-segmentet forrest, én gang pr. spor – så er hver strøm en hel fil.
+      if (!list.length && seg.initSegment) list.push(seg.initSegment);
+      list.push(seg.data);
     });
     tm.on('error', (e) => reject(new Error(e && e.message || 'remux fejlede')));
     try {
-      parts.forEach((p) => tm.push(p));
-      tm.flush();
-      resolve(out);
+      // Flush pr. SEGMENT, ikke én gang til sidst.
+      //
+      // Hvert flush lukker et fragment. Flusher man først til allersidst,
+      // bliver hvert spor ét kæmpefragment, og så er der ikke noget at flette:
+      // filen bliver hele lyden efterfulgt af hele videoen. Ét flush pr.
+      // segment giver mange små fragmenter, som joinTracks kan lægge parvis
+      // sammen hen over tiden.
+      //
+      // Det koster nogle få kilobyte i fragment-hoveder og ikke ét eneste
+      // billede – hvert HLS-segment begynder på et nøglebillede, så der er
+      // intet at klippe midt over.
+      parts.forEach((p) => { tm.push(p); tm.flush(); });
+      resolve(tracks);
     } catch (e) {
       reject(e);
     }
   });
+}
+
+// Lægger de adskilte spor sammen til ÉN fil med begge spor i hvert fragment.
+//
+// Det er vores egen muxer der kan det: den bygger ét nyt moov med begge spor
+// og fletter fragmenterne i tidsrækkefølge. Præcis det DASH- og Vimeo-vejen
+// allerede bruger den til – TS-vejen havde bare aldrig fået glæde af den.
+function joinTracks(tracks) {
+  const video = tracks.video;
+  const audio = tracks.audio;
+
+  // Kun ét spor – eller en mux.js der selv har slået dem sammen. Så er
+  // strømmen allerede en hel fil, og der er intet at flette.
+  if (!video || !audio) return tracks.combined || video || audio || [];
+
+  if (!self.__wfMux) throw new Error('mp4-mux.js er ikke indlæst');
+  return self.__wfMux.mux(video, audio);
 }
 
 function makeFile(parts, ext, suffix = '') {
@@ -421,9 +551,14 @@ async function fetchRange(url, byterange) {
 async function decrypt(buf, seg, cache) {
   let key = cache.get(seg.key.uri);
   if (!key) {
-    const res = await fetch(seg.key.uri, { credentials: 'include' });
-    if (!res.ok) throw new Error('Kunne ikke hente afspilnings-nøglen');
-    const raw = await res.arrayBuffer();
+    // Nøglen er beskyttet på samme måde som segmenterne, så den skal kunne
+    // hentes ad samme vej – ellers falder en AES-128-stream på sidste skridt.
+    let raw;
+    try {
+      raw = await fetchRangeSmart(seg.key.uri, null);
+    } catch (_) {
+      throw new Error('Kunne ikke hente afspilnings-nøglen');
+    }
     key = await crypto.subtle.importKey('raw', raw, 'AES-CBC', false, ['decrypt']);
     cache.set(seg.key.uri, key);
   }

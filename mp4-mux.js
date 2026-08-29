@@ -438,8 +438,25 @@
       .map((b) => copyOf(moof.subarray(b.start, b.start + b.size)));
   }
 
+  // Fortæl at data_offset måles fra moof'ens begyndelse.
+  //
+  // Uden tfhd-flaget default-base-is-moof siger ISO-standarden noget andet:
+  // FØRSTE traf i et moof måles fra moof-starten, men de følgende måles fra
+  // hvor det forrige spors data sluttede. Ligger video og lyd i samme moof,
+  // rammer video derfor rigtigt mens lyden læses langt inde i filen – lyden
+  // er i filen, den bliver bare hentet det forkerte sted fra, og resultatet
+  // er tavshed. Så længe hvert moof kun rummede ét spor, kunne fejlen ikke ses.
+  function setBaseIsMoof(traf) {
+    const tfhd = findDeep(traf, 'tfhd');
+    if (!tfhd) return;
+    // Ordet rummer version (øverste byte) og flags – vi rører kun ét flag.
+    const at = tfhd.start + 8;
+    setU32(traf, at, (u32(traf, at) | 0x020000) >>> 0);
+  }
+
   // Flytter en trafs data-offsets, så de peger på dens plads i det fælles mdat.
   function shiftTraf(traf, newOffset) {
+    setBaseIsMoof(traf);
     const truns = [];
     (function walk(from, to) {
       for (const b of boxes(traf, from, to)) {

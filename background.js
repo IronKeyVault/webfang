@@ -36,7 +36,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // Content-scriptet beder om at få kilderne undersøgt (🔎 Kilder).
   if (msg.type === 'PROBE_MEDIA') {
-    probeAll(msg.items || []).then(sendResponse);
+    probeAll(msg.items || [], sender.tab && sender.tab.id).then(sendResponse);
+    return true;
+  }
+
+  // Offscreen-dokumentet kan ikke selv tale med en fane – vi stiller om, så
+  // den kan få et segment hentet af sidens egen ramme (se pageFetch).
+  if (msg.type === 'PAGE_FETCH') {
+    pageFetch(msg.tabId, msg.req || {}, msg.frameId)
+      .then(sendResponse)
+      .catch((e) => sendResponse({ ok: false, error: e.message || String(e) }));
     return true;
   }
 
@@ -213,6 +222,10 @@ chrome.webRequest.onHeadersReceived.addListener(
       kind,
       seg: kind === 'file' && isSegmentFile(path, details.url),
       size: len ? Number(len.value) || 0 : 0,
+      // Hvilken ramme hentede den? Ligger afspilleren i en iframe (Hotmart,
+      // Vimeo, YouTube-agtige indlejringer), er det DEN ramme der må hente
+      // igen på vores vegne – se pageFetch().
+      frameId: details.frameId >= 0 ? details.frameId : 0,
       ts: Date.now()
     });
   },
@@ -240,6 +253,52 @@ async function getMedia(tabId) {
   return [...map.values()];
 }
 
+// ------------------------------------------------------- hent via siden ---
+//
+// Et signeret CDN (Akamai og lignende) udleverer kun streamen til en
+// forespørgsel der ligner afspillerens: rigtig `Origin`, rigtig `Referer`,
+// sidens cookies. Vores egne fetch-kald – fra service workeren og fra
+// offscreen-dokumentet – har ingen af delene og får 403, selv om afspilleren
+// på siden henter den samme URL uden problemer.
+//
+// Derfor kan vi lade RAMMEN hente for os (src/15-fetch.js). Vi behøver ikke
+// vide hvilke headere CDN'en kigger efter; afsenderen er den rigtige, og så
+// sætter browseren dem selv.
+
+// Hvilken ramme hørte URL'en hjemme i? Kender vi den ikke (fx en variant eller
+// et segment vi selv har regnet os frem til), bruger vi den ramme det seneste
+// medie på fanen kom fra – det er afspillerens.
+async function frameForUrl(tabId, url) {
+  await ensureLoaded();
+  const map = mem.get(tabId);
+  if (!map) return 0;
+  const hit = map.get(url);
+  if (hit && hit.frameId >= 0) return hit.frameId;
+  let last = 0;
+  for (const e of map.values()) if (e.frameId >= 0) last = e.frameId;
+  return last;
+}
+
+// Prøv først rammen vi tror på, dernæst hovedrammen. En ramme kan være væk
+// (afspilleren er skiftet ud) eller uden content-script (sandboxed iframe).
+async function pageFetch(tabId, req, frameId) {
+  if (!tabId) return { ok: false, error: 'ingen fane' };
+  const frames = frameId ? [frameId, 0] : [0];
+  let last = { ok: false, error: 'ingen ramme svarede' };
+  for (const f of frames) {
+    try {
+      const res = await chrome.tabs.sendMessage(
+        tabId, { type: 'WF_FETCH', ...req }, { frameId: f }
+      );
+      if (res && res.ok) return res;
+      if (res) last = res;
+    } catch (e) {
+      last = { ok: false, error: e.message || String(e) };
+    }
+  }
+  return last;
+}
+
 // ------------------------------------------------------------ undersøg ---
 //
 // En side kan sagtens have 30+ medie-URL'er: forhåndsvisninger på hvert
@@ -251,7 +310,7 @@ async function getMedia(tabId) {
 const PROBE_TIMEOUT = 8000;
 const PROBE_MAX = 24;
 
-async function probeAll(items) {
+async function probeAll(items, tabId) {
   const out = [];
   const queue = items.slice(0, PROBE_MAX);
   let i = 0;
@@ -259,7 +318,7 @@ async function probeAll(items) {
     while (i < queue.length) {
       const item = queue[i++];
       try {
-        out.push({ url: item.url, ...(await probeOne(item)) });
+        out.push({ url: item.url, ...(await probeOne(item, tabId)) });
       } catch (e) {
         out.push({ url: item.url, err: e.message || String(e) });
       }
@@ -279,17 +338,36 @@ async function probeFetch(url, init) {
   }
 }
 
-async function probeOne(item) {
-  if (item.kind === 'hls') return probeHls(item.url);
-  if (item.kind === 'dash') return probeDash(item.url);
-  if (item.kind === 'vimeo') return probeVimeo(item.url);
+// Undersøgelse i to forsøg: først vores eget kald, og hvis CDN'en afviser det,
+// samme URL hentet af sidens egen ramme. Står den nye vej for sig selv, kan den
+// direkte vej blive som den er – den virker på langt de fleste sider, og den
+// koster ikke en ekstra rundtur.
+async function probeFetchSmart(url, init, tabId) {
+  try {
+    const res = await probeFetch(url, init);
+    if (res.ok) return { ok: true, text: () => res.text(), res };
+    if (!tabId) return { ok: false, status: res.status };
+  } catch (e) {
+    if (!tabId) throw e;
+  }
+  const via = await pageFetch(tabId, {
+    url, wantBytes: false
+  }, await frameForUrl(tabId, url));
+  if (!via.ok) return { ok: false, status: via.status, error: via.error };
+  return { ok: true, text: async () => via.text, viaPage: true };
+}
+
+async function probeOne(item, tabId) {
+  if (item.kind === 'hls') return probeHls(item.url, tabId);
+  if (item.kind === 'dash') return probeDash(item.url, tabId);
+  if (item.kind === 'vimeo') return probeVimeo(item.url, tabId);
   return probeFile(item.url);
 }
 
-async function probeVimeo(url) {
-  const res = await probeFetch(url);
-  if (!res.ok) return { err: `HTTP ${res.status}` };
-  const data = await res.json();
+async function probeVimeo(url, tabId) {
+  const res = await probeFetchSmart(url, null, tabId);
+  if (!res.ok) return { err: res.error || `HTTP ${res.status}` };
+  const data = JSON.parse(await res.text());
   const vids = data.video || [];
   const best = [...vids].sort((a, b) => (b.height || 0) - (a.height || 0))[0];
   const notes = [`${vids.length} kvaliteter`];
@@ -301,13 +379,18 @@ async function probeVimeo(url) {
   };
 }
 
-async function probeHls(url) {
-  const res = await probeFetch(url);
-  if (!res.ok) return { err: `HTTP ${res.status}` };
+async function probeHls(url, tabId) {
+  const res = await probeFetchSmart(url, null, tabId);
+  if (!res.ok) return { err: res.error || `HTTP ${res.status}` };
   let text = await res.text();
   const notes = [];
+  // En master-playliste er ikke en kvalitet – den er LISTEN over kvaliteter,
+  // og den lader os vælge den bedste. Det skal med tilbage, så valget kan
+  // falde på den frem for en enkelt variant (se sortCands i src/85-video.js).
+  let master = false;
 
   if (/#EXT-X-STREAM-INF/.test(text)) {
+    master = true;
     const variants = [];
     const lines = text.split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
@@ -319,12 +402,14 @@ async function probeHls(url) {
         variants.push({ bw, res: res2, url: new URL(next, url).href });
       }
     }
-    if (!variants.length) return { note: 'master uden kvaliteter' };
+    if (!variants.length) return { master, note: 'master uden kvaliteter' };
     variants.sort((a, b) => b.bw - a.bw);
     notes.push(`master, ${variants.length} kvaliteter, bedst ${variants[0].res ||
       Math.round(variants[0].bw / 1000) + ' kbps'}`);
-    const vres = await probeFetch(variants[0].url);
-    if (!vres.ok) return { note: notes.join('; '), err: `variant HTTP ${vres.status}` };
+    const vres = await probeFetchSmart(variants[0].url, null, tabId);
+    if (!vres.ok) {
+      return { master, note: notes.join('; '), err: vres.error || `variant HTTP ${vres.status}` };
+    }
     text = await vres.text();
   }
 
@@ -338,9 +423,9 @@ async function probeHls(url) {
   return { dur, note: notes.join('; ') };
 }
 
-async function probeDash(url) {
-  const res = await probeFetch(url);
-  if (!res.ok) return { err: `HTTP ${res.status}` };
+async function probeDash(url, tabId) {
+  const res = await probeFetchSmart(url, null, tabId);
+  if (!res.ok) return { err: res.error || `HTTP ${res.status}` };
   const text = await res.text();
   const iso = (text.match(/mediaPresentationDuration="([^"]+)"/) || [])[1] || '';
   const m = iso.match(/P(?:(\d+)D)?T(?:([\d.]+)H)?(?:([\d.]+)M)?(?:([\d.]+)S)?/);
@@ -426,7 +511,10 @@ async function downloadMedia(msg, tabId) {
     const res = await runInOffscreen({
       type: kind === 'hls' ? 'OFFSCREEN_HLS'
         : kind === 'dash' ? 'OFFSCREEN_DASH' : 'OFFSCREEN_VIMEO',
-      url, tabId
+      url, tabId,
+      // Hvilken ramme afspilleren hører hjemme i – offscreen-dokumentet skal
+      // kunne bede DEN om at hente, hvis CDN'en afviser vores egne kald.
+      frameId: await frameForUrl(tabId, url)
     });
     if (!res || !res.ok) throw new Error((res && res.error) || 'Kunne ikke samle videoen');
 

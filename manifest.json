@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Webfang",
-  "version": "1.13.0",
+  "version": "1.16.1",
   "description": "Optag en artikel fra en webside inkl. billeder og kopiér til udklipsholder som rich HTML – eller hent sidens video ned som fil.",
   "permissions": [
     "activeTab",
@@ -37,6 +37,7 @@
         "src/00-core.js",
         "src/05-state.js",
         "src/10-text.js",
+        "src/15-fetch.js",
         "src/20-ui.js",
         "src/30-page.js",
         "src/40-media.js",

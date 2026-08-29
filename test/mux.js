@@ -253,7 +253,7 @@ function mvex(trackId) {
 function makeFragmentedMp4(opts) {
   const {
     count, trackId = 1, timescale = 1000, step = 1000, handler = 'vide',
-    payload, dataOffset = true
+    payload, dataOffset = true, baseIsMoof = true
   } = opts;
   const moov = box('moov',
     mvhd(timescale, 0, trackId + 1),
@@ -278,7 +278,7 @@ function makeFragmentedMp4(opts) {
     const build = (off) => box('moof',
       fullBox('mfhd', 0, u32(n + 1)),
       box('traf',
-        flagBox('tfhd', 0, 0x020000, u32(trackId)),
+        flagBox('tfhd', 0, baseIsMoof ? 0x020000 : 0, u32(trackId)),
         fullBox('tfdt', 1, u64(n * step)),
         trun(off)));
     const moof = build(build(0).length + 8);
@@ -312,16 +312,19 @@ console.log('\nfragmenteret MP4: video + lyd');
       const m = out.subarray(off, off + size);
       const dv = new DataView(m.buffer, m.byteOffset);
       let seq = -1;
-      const ids = [], offsets = [];
+      const ids = [], offsets = [], tfhdFlags = [];
       for (let i = 0; i + 8 < m.length; i++) {
         const bt = String.fromCharCode(...m.subarray(i + 4, i + 8));
         if (bt === 'mfhd') seq = dv.getUint32(i + 12);
-        if (bt === 'tfhd') ids.push(dv.getUint32(i + 12));
+        if (bt === 'tfhd') {
+          ids.push(dv.getUint32(i + 12));
+          tfhdFlags.push(dv.getUint32(i + 8) & 0xffffff);
+        }
         // trun med flag 0x201: sample_count, data_offset, sample_size
         // trun: size, type, version/flags, sample_count, data_offset, sample_size
         if (bt === 'trun') offsets.push({ at: dv.getInt32(i + 16), len: dv.getUint32(i + 20) });
       }
-      frags.push({ seq, ids, offsets, start: off, size });
+      frags.push({ seq, ids, offsets, tfhdFlags, start: off, size });
     }
     if (size < 8) break;
     off += size;
@@ -337,6 +340,16 @@ console.log('\nfragmenteret MP4: video + lyd');
   ok('mfhd-sekvensen stiger gennem hele filen',
     frags.every((f, i) => f.seq === i + 1),
     frags.map((f) => f.seq).join(','));
+
+  // Uden default-base-is-moof siger ISO-standarden at ANDET spor i en moof
+  // måles fra hvor det første spors data sluttede – ikke fra moof'ens start.
+  // Vi regner fra moof-starten, så flaget SKAL stå der. Gør det ikke det,
+  // rammer video stadig rigtigt (den ligger først) mens lyden læses langt
+  // inde i filen: filen ser hel ud og er tavs.
+  ok('hver traf siger default-base-is-moof',
+    frags.every((f) => f.tfhdFlags.length === 2 &&
+      f.tfhdFlags.every((fl) => (fl & 0x020000) !== 0)),
+    frags.map((f) => f.tfhdFlags.map((x) => '0x' + x.toString(16)).join('+')).join(' '));
 
   const ids = readTrackIds(out);
   ok('to spor i moov med hver sit id', ids.length === 2 && ids[0] !== ids[1], ids.join(','));
@@ -376,6 +389,46 @@ console.log('\nfragmenteret MP4: video + lyd');
   const total = [...v.medias, ...a.medias].reduce((n, m) => n + m.length, 0);
   const mdatBytes = frags.reduce((n, f) => n + f.offsets.reduce((s, o) => s + o.len, 0), 0);
   ok('al mediedata er med', mdatBytes === total, `${mdatBytes} af ${total}`);
+}
+
+// Det er sådan mux.js' egen uddata ser ud: offsets måles fra moof-starten,
+// men flaget der siger det, er ikke sat. Så længe hvert moof kun rummede ét
+// spor, gjorde det ingen forskel. Lægger vi to spor i samme moof, skal
+// muxeren sætte flaget selv – ellers bliver lyden tavs.
+console.log('\nfragmenteret MP4: input uden flaget får det sat');
+{
+  const opts = { count: 3, trackId: 1, baseIsMoof: false };
+  const v = makeFragmentedMp4({
+    ...opts, timescale: 25, step: 150, handler: 'vide',
+    payload: (n) => marked(n, 500, 10)
+  });
+  const a = makeFragmentedMp4({
+    ...opts, timescale: 48000, step: 288000, handler: 'soun',
+    payload: (n) => marked(n, 200, 100)
+  });
+  const out = concat(MUX.mux([v.bytes], [a.bytes]));
+
+  const flags = [];
+  let off = 0;
+  while (off + 8 <= out.length) {
+    const dv0 = new DataView(out.buffer, out.byteOffset);
+    const size = dv0.getUint32(off);
+    const t = String.fromCharCode(...out.subarray(off + 4, off + 8));
+    if (t === 'moof') {
+      const m = out.subarray(off, off + size);
+      const dv = new DataView(m.buffer, m.byteOffset);
+      for (let i = 0; i + 8 < m.length; i++) {
+        if (String.fromCharCode(...m.subarray(i + 4, i + 8)) === 'tfhd') {
+          flags.push(dv.getUint32(i + 8) & 0xffffff);
+        }
+      }
+    }
+    if (size < 8) break;
+    off += size;
+  }
+  ok('muxeren sætter flaget selv', flags.length === 6 &&
+    flags.every((fl) => (fl & 0x020000) !== 0),
+    `${flags.length} trafs: ` + flags.map((x) => '0x' + x.toString(16)).join(' '));
 }
 
 console.log('\nfragmenteret MP4: traf uden data-offset falder tilbage til én moof pr. spor');

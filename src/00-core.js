@@ -9,7 +9,7 @@
 // stadig det GAMLE script kørende. Uden versionsnummer ville en ny indsprøjtning
 // blive afvist, og nye funktioner ville lydløst ikke virke.
 (() => {
-  const VERSION = 31;
+  const VERSION = 33;
   if (window.__wf && window.__wf.version >= VERSION) return;
 
   const WF = { version: VERSION, _mods: Object.create(null) };

@@ -100,10 +100,19 @@
       return 1;
     }
 
+    // En master-playliste er ikke én kvalitet – den er LISTEN over dem alle,
+    // og hentningen vælger så den bedste. En enkelt variant låser dig fast på
+    // lige den kvalitet afspilleren tilfældigvis stod på, da du fangede den,
+    // og streaming-afspillere starter altid lavt. De to måler samme spilletid,
+    // så uden det her afgøres valget af rækkefølgen på netværket – og det
+    // faldt ud til den dårligste.
+    const masterRank = (c) => (c.master ? 0 : 1);
+
     function sortCands(list) {
       return list.sort((a, b) =>
         (rank(a) - rank(b)) ||
         ((b.dur || 0) - (a.dur || 0)) ||
+        (masterRank(a) - masterRank(b)) ||
         ((b.size || 0) - (a.size || 0)) ||
         ((b.ts || 0) - (a.ts || 0))
       );
@@ -138,7 +147,11 @@
     function labelFor(c) {
       let name = c.url;
       try { name = new URL(c.url).pathname.split('/').pop() || c.url; } catch (_) {}
-      const kind = c.kind === 'hls' ? 'stream' : c.kind === 'dash' ? 'DASH'
+      // Navnene på to varianter af samme video ligner hinanden til forveksling,
+      // og det der skiller dem ad – bitraten – står til sidst, hvor
+      // afkortningen rammer. Så sig det med ord i stedet.
+      const kind = c.master ? 'stream, alle kvaliteter'
+        : c.kind === 'hls' ? 'stream' : c.kind === 'dash' ? 'DASH'
         : c.kind === 'vimeo' ? 'Vimeo' : c.seg ? 'stump' : 'fil';
       const dur = c.dur ? ` ⏱ ${fmtDur(c.dur)}` : '';
       return `${name.slice(0, 48)} – ${kind}${dur}${fmtSize(c.size)}`;
@@ -220,6 +233,7 @@
         if (r.size && !c.size) c.size = r.size;
         if (r.note) c.note = r.note;
         if (r.err) c.err = r.err;
+        if (r.master) c.master = true;
       });
       const wasSel = cands[Number(keep) || 0];
       sortCands(cands);
