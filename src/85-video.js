@@ -214,6 +214,11 @@
 
     let probed = false;
 
+    // Har brugeren selv rørt dropdown'en? Kun et klik tæller som et valg –
+    // se probe() om hvorfor feltets indhold ikke kan bruges til det.
+    let userPicked = false;
+    vSelect.addEventListener('change', () => { userPicked = true; });
+
     async function probe(quiet) {
       const s = WF.state;
       const cands = s.vidCands || [];
@@ -240,7 +245,12 @@
       probed = true;
       showCandidates(cands);
       // Har brugeren selv valgt en kilde, følger valget med efter omsorteringen.
-      if (wasSel && keep) {
+      //
+      // Det skal måles på om der er KLIKKET, ikke på hvad der står i feltet:
+      // uden et klik står der "0" — en ikke-tom streng, altså sand — og så
+      // gendanner vi et valg brugeren aldrig har truffet. Det ruller
+      // sorteringen tilbage, og master-playlisten kom aldrig øverst.
+      if (userPicked && wasSel) {
         const i = cands.indexOf(wasSel);
         if (i >= 0) vSelect.value = String(i);
       }
@@ -331,6 +341,7 @@
       s.phase = 'vhover';
       s.vidCands = [];
       probed = false;
+      userPicked = false;
       document.documentElement.append(WF.ui.overlay, vToolbar);
       vToolbar.style.display = 'none';
       document.addEventListener('mousemove', onMove, true);
@@ -345,6 +356,7 @@
       s.currentEl = null;
       s.vidCands = [];
       probed = false;
+      userPicked = false;
       document.removeEventListener('mousemove', onMove, true);
       document.removeEventListener('click', onClick, true);
       WF.app.unlistenGlobal();
