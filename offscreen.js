@@ -172,10 +172,15 @@ async function buildHls(url, tabId) {
   });
 
   if (pl.map) {
-    // fMP4: init-segmentet forrest, så er filen en færdig .mp4.
+    // fMP4: init-segmentet forrest, så er filen en færdig .mp4. Init-segmentet
+    // kommer fra en CDN og har alle varigheder sat til 0 – afspilleren får dem
+    // gennem playlisten, ikke gennem filen. På disken er der ingen playliste,
+    // så tallene skal skrives ind, præcis som på DASH- og TS-vejene.
     const initBuf = await fetchRangeSmart(pl.map.url, pl.map.byterange);
     tick(initBuf.byteLength);
-    return { ok: true, files: [makeFile([new Uint8Array(initBuf), ...parts], 'mp4')] };
+    const whole = [new Uint8Array(initBuf), ...parts];
+    if (self.__wfDuration) self.__wfDuration.stamp(whole);
+    return { ok: true, files: [makeFile(whole, 'mp4')] };
   }
 
   // MPEG-TS: skal remuxes for at blive en .mp4 (se remuxTs).
@@ -240,6 +245,12 @@ async function assembleStreams(streams, tabId) {
     try {
       progress(tabId, 'Lægger video og lyd sammen…');
       const merged = self.__wfMux.mux(video.parts, audio.parts);
+      // Init-segmenterne fra en DASH-stream har alle varigheder sat til 0 –
+      // afspilleren får dem gennem playlisten, ikke gennem filen. En fil på
+      // disken har ingen playliste, så tallene skal skrives ind, præcis som på
+      // TS-vejen nedenfor. Uden dem kunne ffmpeg slet ikke bestemme længden af
+      // de sammenlagte film, og afspillerne måtte gætte. Se mp4-duration.js.
+      if (self.__wfDuration) self.__wfDuration.stamp(merged);
       return { ok: true, files: [makeFile(merged, 'mp4')], note: '' };
     } catch (e) {
       muxNote = `lyden ligger for sig (kunne ikke samles: ${e.message || e})`;

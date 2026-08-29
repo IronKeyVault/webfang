@@ -105,6 +105,7 @@
     const [u8, dv] = view(part);
     let movieTs = 0;
     let mvhd = -1;
+    let mehd = -1;
     const traks = [];
 
     boxes(u8, dv, 0, u8.length, (type, box, body, end) => {
@@ -113,6 +114,12 @@
         if (t2 === 'mvhd') {
           movieTs = dv.getUint32(at(body2, u8[body2], 12, 20));
           mvhd = body2;
+          return;
+        }
+        if (t2 === 'mvex') {
+          boxes(u8, dv, body2, end2, (t3, box3, body3) => {
+            if (t3 === 'mehd') mehd = body3;
+          });
           return;
         }
         if (t2 !== 'trak') return;
@@ -153,6 +160,12 @@
 
     // Filmens varighed er det længste spor.
     writeDur(dv, u8, mvhd, 16, 24, longest);
+
+    // mehd siger det samme om en fragmenteret film, og nogle afspillere tror
+    // på den frem for mvhd. Vores egen muxer kopierer mvex – og dermed mehd –
+    // uændret fra videosporet, så stod der videoens længde, også når lyden var
+    // den længste af de to. Her får den det rigtige tal med.
+    if (mehd >= 0) writeDur(dv, u8, mehd, 4, 4, longest);
     return true;
   }
 

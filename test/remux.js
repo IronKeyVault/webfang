@@ -71,8 +71,16 @@ ok('holder sporene adskilt (remux: false)', /remux:\s*false/.test(offscreen));
 ok('lader ikke mux.js slå sporene sammen', !/remux:\s*true/.test(offscreen));
 ok('fletter sporene med vores egen muxer',
   /__wfMux\.mux\(video,\s*audio\)/.test(offscreen));
-ok('varigheder skrives ind bagefter',
-  /__wfDuration\.stamp\(/.test(offscreen));
+// Fejlen der kostede: stamp() blev kun kaldt på TS-vejen. DASH-filerne kom
+// derfor på disken med mvhd, tkhd og mdhd sat til 0 – ffmpeg kunne slet ikke
+// bestemme deres længde, og afspillerne måtte gætte. Ét kald er ikke nok til
+// at vise at begge veje er dækket, så de tælles hver for sig.
+ok('varigheder skrives ind bagefter — TS-vejen',
+  /__wfDuration\.stamp\(out\)/.test(offscreen));
+ok('varigheder skrives ind bagefter — mux-vejen',
+  /__wfDuration\.stamp\(merged\)/.test(offscreen));
+ok('varigheder skrives ind bagefter — HLS-fMP4-vejen',
+  /__wfDuration\.stamp\(whole\)/.test(offscreen));
 
 console.log(failed ? `\n${failed} fejl` : '\nalt grønt');
 process.exit(failed ? 1 : 0);

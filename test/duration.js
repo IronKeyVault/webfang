@@ -46,6 +46,8 @@ const tkhd = (id) => box('tkhd', zeros(4), zeros(8), u32(id), zeros(4), u32(UNKN
 const mdhd = (ts) => box('mdhd', zeros(4), zeros(8), u32(ts), u32(UNKNOWN), zeros(4));
 
 const trak = (id, mediaTs) => box('trak', tkhd(id), box('mdia', mdhd(mediaTs)));
+// mehd v0: vf, fragment_duration — filmens længde i en fragmenteret MP4.
+const mehd = (dur) => box('mehd', zeros(4), u32(dur));
 
 const init = (movieTs, traks) =>
   concat([box('ftyp', zeros(16)), box('moov', mvhd(movieTs), ...traks)]);
@@ -84,6 +86,7 @@ const tkhdDur = (u8, n) => read(u8, 'tkhd', 24, n);
 const tkhdId = (u8, n) => read(u8, 'tkhd', 16, n);
 const mdhdDur = (u8, n) => read(u8, 'mdhd', 20, n);
 const mdhdTs = (u8, n) => read(u8, 'mdhd', 16, n);
+const mehdDur = (u8) => read(u8, 'mehd', 8);
 
 // ---- Målingen -------------------------------------------------------------
 
@@ -130,6 +133,22 @@ console.log('\nvarigheder skrives i de rigtige felter');
   ok('timescales står urørt', mvhdTs(head) === 1000 &&
     mdhdTs(head, 0) === 90000 && mdhdTs(head, 1) === 44100);
   ok('track-id står urørt', tkhdId(head, 0) === 1 && tkhdId(head, 1) === 2);
+}
+
+console.log('\nmehd får det længste spor, ikke det første');
+{
+  // I en fragmenteret MP4 er det ofte mehd afspilleren tror på. Vores egen
+  // muxer bygger den nye moov af VIDEOENS dele og kopierer mvex – og dermed
+  // mehd – med uændret. Var lyden det længste af de to spor, blev filmen
+  // derfor skåret af ved videoens slutning.
+  const head = concat([box('ftyp', zeros(16)),
+    box('moov', mvhd(1000), trak(1, 90000), trak(2, 44100),
+      box('mvex', mehd(2000)))]);
+  // Video: 2 s. Lyd: 3 s.
+  const parts = [head, frag(1, [90000, 90000]), frag(2, [44100, 44100, 44100])];
+  ok('stamp() melder at den rettede noget', D.stamp(parts) === true);
+  ok('mehd får det længste spor', mehdDur(head) === 3000, 'fik ' + mehdDur(head));
+  ok('mvhd siger det samme', mvhdDur(head) === 3000, 'fik ' + mvhdDur(head));
 }
 
 console.log('\nmoov findes uanset hvor den ligger');
