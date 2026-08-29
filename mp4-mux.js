@@ -211,6 +211,7 @@
     const moofs = top.filter((b) => b.type === 'moof');
     if (moofs.length) {
       file.fragments = readFragments(r, top, moofs, file.mediaTimescale, what);
+      file.timed = file.fragments.every((f) => f.timed);
       return file;
     }
 
@@ -244,9 +245,10 @@
       const moof = r.read(m.start, m.size);
       const tfdt = findDeep(moof, 'tfdt');
       let time = 0;
+      let raw = 0;
       if (tfdt) {
         const version = moof[tfdt.start + 8];
-        const raw = version === 1 ? u64(moof, tfdt.start + 12) : u32(moof, tfdt.start + 12);
+        raw = version === 1 ? u64(moof, tfdt.start + 12) : u32(moof, tfdt.start + 12);
         time = timescale ? raw / timescale : raw;
       } else {
         time = i; // ingen tidsstempler: behold filens egen rækkefølge
@@ -258,12 +260,17 @@
       const media = r.slice(m.start + m.size, end);
       const data = [];
       let dataLength = 0;
+      // Hvor fragmentets mediedata begynder, målt fra moof'ens start – det er
+      // samme målestok som trun'ens data_offset, så de to kan regnes sammen.
+      let dataStart = 0;
       for (const b of topBoxesIn(r, m.start + m.size, end)) {
         if (b.type !== 'mdat') continue;
+        if (!dataLength) dataStart = b.start + b.headerSize - m.start;
         data.push(...r.slice(b.start + b.headerSize, b.start + b.size));
         dataLength += b.size - b.headerSize;
       }
-      out.push({ moof, media, data, dataLength, time });
+      out.push({ moof, media, data, dataLength, dataStart, time, timeRaw: raw,
+        timed: !!tfdt });
     }
     if (!out.length) throw new Error(`fandt ingen fragmenter i ${what}`);
     return out;
@@ -406,12 +413,13 @@
 
     const parts = [v.ftyp, buildMoov(v, a, audioTrak, audioTrex, audioId)];
 
-    // Begge spors track fragments lægges i én moof pr. tidsinterval, med ét
-    // fælles mdat bagefter. Det er den form ffmpeg skriver, og den form
-    // afspillere forventer. Ét spor pr. moof er lige så lovligt, men VLC
-    // gengiver ikke lyden af sådan en fil – den ser sporet og tier.
-    if (canCombine(v.fragments) && canCombine(a.fragments)) {
-      appendCombined(parts, v.fragments, a.fragments, audioId);
+    // Videoens opdeling beholdes, og lyden skæres om så hvert moof bærer
+    // samme stykke tid i begge spor. Det kræver at begge spor har rigtige
+    // tidsstempler; uden dem er et fragments `time` blot dets nummer (se
+    // readFragments), og så er der intet at skære efter.
+    if (v.timed && a.timed && canCombine(v.fragments) && canCombine(a.fragments)) {
+      appendCoTimed(parts, v.fragments, a.fragments, audioId,
+        a.mediaTimescale, trexDefaults(a));
       return parts;
     }
 
@@ -454,24 +462,34 @@
     setU32(traf, at, (u32(traf, at) | 0x020000) >>> 0);
   }
 
-  // Flytter en trafs data-offsets, så de peger på dens plads i det fælles mdat.
-  function shiftTraf(traf, newOffset) {
-    setBaseIsMoof(traf);
+  function trunsIn(bytes, from, to) {
     const truns = [];
-    (function walk(from, to) {
-      for (const b of boxes(traf, from, to)) {
-        if (b.type === 'trun') truns.push(b);
-        else if (CONTAINERS.has(b.type)) walk(b.start + b.headerSize, b.start + b.size);
+    (function walk(a, b) {
+      for (const box of boxes(bytes, a, b)) {
+        if (box.type === 'trun') truns.push(box);
+        else if (CONTAINERS.has(box.type)) walk(box.start + box.headerSize, box.start + box.size);
       }
-    })(8, traf.length);
+    })(from, to);
+    return truns;
+  }
 
+  const trunsOf = (traf) => trunsIn(traf, 8, traf.length);
+
+  // Flytter et fragments trafs, så dets mediedata begynder på `newOffset`
+  // regnet fra moof'ens start. Alle offsets flyttes med det SAMME spring, så
+  // sporenes indbyrdes placering inde i fragmentets data er uændret – ellers
+  // ville et fragment med mere end én traf få dem oven i hinanden.
+  function shiftFragment(trafs, newOffset) {
     let delta = null;
-    for (const trun of truns) {
-      if ((u32(traf, trun.start + 8) & 0x000001) === 0) continue;
-      const at = trun.start + 16;
-      const old = (u32(traf, at) | 0);           // data_offset er fortegnsbærende
-      if (delta === null) delta = newOffset - old;
-      setU32(traf, at, (old + delta) >>> 0);
+    for (const traf of trafs) {
+      setBaseIsMoof(traf);
+      for (const trun of trunsOf(traf)) {
+        if ((u32(traf, trun.start + 8) & 0x000001) === 0) continue;
+        const at = trun.start + 16;
+        const old = (u32(traf, at) | 0);         // data_offset er fortegnsbærende
+        if (delta === null) delta = newOffset - old;
+        setU32(traf, at, (old + delta) >>> 0);
+      }
     }
   }
 
@@ -490,59 +508,191 @@
     return h;
   }
 
-  function appendCombined(parts, vFrags, aFrags, audioId) {
-    // Ét video- og ét lydfragment pr. gruppe. Bliver der lyd tilovers (de to
-    // spor er sjældent skåret i præcis lige mange stykker), følger resten med
-    // i den sidste gruppe, så intet falder på gulvet.
-    const groups = [];
-    const n = Math.max(vFrags.length, aFrags.length);
-    for (let i = 0; i < n; i++) {
-      groups.push({
-        video: i < vFrags.length ? vFrags[i] : null,
-        audio: i < aFrags.length ? [aFrags[i]] : []
-      });
-    }
-    if (aFrags.length > vFrags.length && vFrags.length) {
-      // Lyden må ikke ende i grupper uden billede efter filens sidste billede;
-      // de sidste stykker lyd hægtes på den sidste rigtige gruppe.
-      const tail = groups.splice(vFrags.length);
-      groups[groups.length - 1].audio.push(...tail.flatMap((g) => g.audio));
-    }
+  // ---- Lyden skæres om, så et moof dækker samme tid i begge spor ----------
+  //
+  // Videoens og lydens fragmenter er sjældent lige lange – her 6,000 s mod
+  // 5,99467 s. Lægger man dem sammen som de kommer, beskriver de to trafs i ét
+  // moof derfor hver sit stykke tid. Parret på indeks voksede forskellen til
+  // 12 s; selv med nærmeste nabo stod der 1,6–3 s tilbage. VLC hakkede og
+  // tabte små stumper lyd af netop dét, mens Edge ikke opdagede noget.
+  //
+  // Ét spor pr. moof fjerner forskydningen, men den form gengiver VLC ikke
+  // lyden af overhovedet – filen er tavs, selv om alle bytes er der.
+  //
+  // Så tilbage står det ffmpeg gør: behold videoens opdeling, og skær lyden om
+  // så hvert moof bærer præcis de lydsamples der hører til dét stykke film.
+  // Kun sample-TABELLEN skrives om; lyddataene sendes videre som de udsnit de
+  // allerede ligger i, så intet omkodes og intet kopieres.
 
-    let seq = 1;
-    for (const g of groups) {
-      const members = [];
-      if (g.video) members.push({ frag: g.video, audio: false });
-      for (const f of g.audio) members.push({ frag: f, audio: true });
-      if (!members.length) continue;
+  // trex bærer de fælles standardværdier, som en traf må nøjes med at henvise
+  // til i stedet for at gentage dem for hver sample.
+  function trexDefaults(file) {
+    const trex = findDeep(file.moov, 'trex', file.moovHeader, file.moov.length);
+    if (!trex) return { duration: 0, size: 0, flags: 0 };
+    return {
+      duration: u32(file.moov, trex.start + 20),
+      size: u32(file.moov, trex.start + 24),
+      flags: u32(file.moov, trex.start + 28)
+    };
+  }
 
-      const trafs = [];
-      for (const m of members) {
-        for (const traf of trafsOf(m.frag.moof)) {
-          if (m.audio) {
-            const tfhd = findDeep(traf, 'tfhd');
-            if (tfhd) setU32(traf, tfhd.start + 12, audioId);
-          }
-          trafs.push(traf);
+  // Hver sample i et fragment, foldet ud: hvornår den begynder, hvor længe den
+  // varer, hvor stor den er, og hvor i fragmentets data den ligger. Værdier
+  // der ikke står i trun'en hentes fra tfhd'en, og ellers fra trex.
+  function pushSamples(frag, defaults, table) {
+    const moof = frag.moof;
+    for (const trafBox of boxes(moof, 8, moof.length)) {
+      if (trafBox.type !== 'traf') continue;
+      const from = trafBox.start + trafBox.headerSize;
+      const to = trafBox.start + trafBox.size;
+
+      let defDur = defaults.duration;
+      let defSize = defaults.size;
+      let defFlags = defaults.flags;
+      const tfhd = findDeep(moof, 'tfhd', from, to);
+      if (tfhd) {
+        const fl = u32(moof, tfhd.start + 8) & 0xffffff;
+        let p = tfhd.start + 16;
+        if (fl & 0x01) p += 8;                       // base_data_offset
+        if (fl & 0x02) p += 4;                       // sample_description_index
+        if (fl & 0x08) { defDur = u32(moof, p); p += 4; }
+        if (fl & 0x10) { defSize = u32(moof, p); p += 4; }
+        if (fl & 0x20) { defFlags = u32(moof, p); p += 4; }
+      }
+
+      let time = frag.timeRaw;
+      for (const trun of trunsIn(moof, from, to)) {
+        const fl = u32(moof, trun.start + 8) & 0xffffff;
+        const count = u32(moof, trun.start + 12);
+        let p = trun.start + 16;
+        let at = 0;
+        if (fl & 0x000001) { at = (u32(moof, p) | 0) - frag.dataStart; p += 4; }
+        let firstFlags = null;
+        if (fl & 0x000004) { firstFlags = u32(moof, p); p += 4; }
+        for (let i = 0; i < count; i++) {
+          let dur = defDur, size = defSize, sflags = defFlags, cts = 0;
+          if (fl & 0x000100) { dur = u32(moof, p); p += 4; }
+          if (fl & 0x000200) { size = u32(moof, p); p += 4; }
+          if (fl & 0x000400) { sflags = u32(moof, p); p += 4; }
+          if (fl & 0x000800) { cts = u32(moof, p) | 0; p += 4; }
+          table.time.push(time);
+          table.dur.push(dur);
+          table.size.push(size);
+          table.flags.push(i === 0 && firstFlags !== null ? firstFlags : sflags);
+          table.cts.push(cts);
+          table.frag.push(frag);
+          table.pos.push(at);
+          time += dur;
+          at += size;
         }
       }
+    }
+  }
+
+  // Udsnit af et fragments data, uden at kopiere: samples der ligger i
+  // forlængelse af hinanden samles til ét udsnit.
+  function sampleBytes(table, lo, hi) {
+    const out = [];
+    let bytes = 0;
+    let i = lo;
+    while (i < hi) {
+      const frag = table.frag[i];
+      const from = table.pos[i];
+      let to = from + table.size[i];
+      let j = i + 1;
+      while (j < hi && table.frag[j] === frag && table.pos[j] === to) {
+        to += table.size[j];
+        j++;
+      }
+      let pos = 0;
+      for (const part of frag.data) {
+        const a = Math.max(from, pos);
+        const b = Math.min(to, pos + part.length);
+        if (b > a) out.push(part.subarray(a - pos, b - pos));
+        pos += part.length;
+        if (pos >= to) break;
+      }
+      bytes += to - from;
+      i = j;
+    }
+    return { parts: out, bytes };
+  }
+
+  // En traf der beskriver samples [lo, hi) af tabellen. Alt står i trun'en, så
+  // den er uafhængig af hvilke standardværdier kildens tfhd satte.
+  function buildTraf(table, lo, hi, trackId) {
+    const count = hi - lo;
+    let hasCts = false;
+    for (let i = lo; i < hi; i++) if (table.cts[i] !== 0) { hasCts = true; break; }
+
+    const tfhd = new Uint8Array(16);
+    setU32(tfhd, 0, 16);
+    tfhd.set([0x74, 0x66, 0x68, 0x64], 4);           // 'tfhd'
+    setU32(tfhd, 8, 0x020000);                       // default-base-is-moof
+    setU32(tfhd, 12, trackId);
+
+    const tfdt = new Uint8Array(20);
+    setU32(tfdt, 0, 20);
+    tfdt.set([0x74, 0x66, 0x64, 0x74], 4);           // 'tfdt'
+    setU32(tfdt, 8, 0x01000000);                     // version 1: 64-bit tid
+    setU64(tfdt, 12, table.time[lo]);
+
+    // data-offset, varighed, størrelse og flag pr. sample – og cts kun hvis
+    // nogen af dem har en. Version 1 gør cts fortegnsbærende.
+    const flags = 0x000001 | 0x000100 | 0x000200 | 0x000400 | (hasCts ? 0x000800 : 0);
+    const stride = 12 + (hasCts ? 4 : 0);
+    const trun = new Uint8Array(20 + count * stride);
+    setU32(trun, 0, trun.length);
+    trun.set([0x74, 0x72, 0x75, 0x6e], 4);           // 'trun'
+    setU32(trun, 8, (hasCts ? 0x01000000 : 0) | flags);
+    setU32(trun, 12, count);
+    setU32(trun, 16, 0);                             // sættes når moof'en er målt
+    let p = 20;
+    for (let i = lo; i < hi; i++) {
+      setU32(trun, p, table.dur[i]); p += 4;
+      setU32(trun, p, table.size[i]); p += 4;
+      setU32(trun, p, table.flags[i]); p += 4;
+      if (hasCts) { setU32(trun, p, table.cts[i] >>> 0); p += 4; }
+    }
+    return makeBox('traf', [tfhd, tfdt, trun]);
+  }
+
+  function appendCoTimed(parts, vFrags, aFrags, audioId, audioTimescale, defaults) {
+    const table = { time: [], dur: [], size: [], flags: [], cts: [], frag: [], pos: [] };
+    for (const f of aFrags) pushSamples(f, defaults, table);
+
+    let seq = 1;
+    let lo = 0;
+    for (let g = 0; g < vFrags.length; g++) {
+      const vf = vFrags[g];
+      // Grænsen er næste videofragments start, målt i lydens tidsskala. Det
+      // sidste moof tager resten, så en hale af lyd ikke falder på gulvet.
+      const limit = g + 1 < vFrags.length
+        ? vFrags[g + 1].time * audioTimescale : Infinity;
+      let hi = lo;
+      while (hi < table.time.length && table.time[hi] < limit) hi++;
+
+      const trafs = trafsOf(vf.moof);
+      const audio = hi > lo ? buildTraf(table, lo, hi, audioId) : null;
 
       const mfhd = mfhdBox(seq++);
       let moofSize = 8 + mfhd.length;
       for (const t of trafs) moofSize += t.length;
+      if (audio) moofSize += audio.length;
 
-      // data_offset måles fra moof'ens begyndelse (default-base-is-moof).
-      let at = moofSize + 8; // + mdat-headeren
-      let ti = 0;
-      for (const m of members) {
-        const count = trafsOf(m.frag.moof).length;
-        for (let k = 0; k < count; k++) shiftTraf(trafs[ti++], at);
-        at += m.frag.dataLength;
+      // Videoen først i det fælles mdat, lyden bagefter.
+      shiftFragment(trafs, moofSize + 8);
+      let extra = { parts: [], bytes: 0 };
+      if (audio) {
+        const trun = findDeep(audio, 'trun');
+        setU32(audio, trun.start + 16, moofSize + 8 + vf.dataLength);
+        extra = sampleBytes(table, lo, hi);
       }
 
-      const dataLength = members.reduce((sum, m) => sum + m.frag.dataLength, 0);
-      parts.push(makeBox('moof', [mfhd, ...trafs]), mdatHeaderFor(dataLength));
-      for (const m of members) parts.push(...m.frag.data);
+      parts.push(makeBox('moof', audio ? [mfhd, ...trafs, audio] : [mfhd, ...trafs]),
+        mdatHeaderFor(vf.dataLength + extra.bytes));
+      parts.push(...vf.data, ...extra.parts);
+      lo = hi;
     }
   }
 

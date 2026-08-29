@@ -253,7 +253,7 @@ function mvex(trackId) {
 function makeFragmentedMp4(opts) {
   const {
     count, trackId = 1, timescale = 1000, step = 1000, handler = 'vide',
-    payload, dataOffset = true, baseIsMoof = true
+    payload, dataOffset = true, baseIsMoof = true, samples = 1
   } = opts;
   const moov = box('moov',
     mvhd(timescale, 0, trackId + 1),
@@ -272,9 +272,15 @@ function makeFragmentedMp4(opts) {
     // trun-flag 0x201 = data-offset og sample-størrelse med. data_offset måles
     // fra moof'ens begyndelse (tfhd-flag 0x20000, default-base-is-moof), så
     // det kendes først når moof'ens størrelse kendes: byg, mål, byg igen.
+    // Varighed og størrelse pr. sample (flag 0x100 og 0x200), så et fragment
+    // kan rumme flere samples – det er dem muxeren skal kunne dele op igen.
+    const rows = [];
+    for (let k = 0; k < samples; k++) {
+      rows.push(u32(step / samples), u32(data.length / samples));
+    }
     const trun = (off) => dataOffset
-      ? flagBox('trun', 0, 0x000201, u32(1), u32(off), u32(data.length))
-      : flagBox('trun', 0, 0x000200, u32(1), u32(data.length));
+      ? flagBox('trun', 0, 0x000301, u32(samples), u32(off), concat(rows))
+      : flagBox('trun', 0, 0x000300, u32(samples), concat(rows));
     const build = (off) => box('moof',
       fullBox('mfhd', 0, u32(n + 1)),
       box('traf',
@@ -288,58 +294,115 @@ function makeFragmentedMp4(opts) {
   return { bytes: concat(parts), medias };
 }
 
+// Bokse på filens øverste niveau, talt op efter type.
+function topCounts(out) {
+  const dv = new DataView(out.buffer, out.byteOffset);
+  const counts = {};
+  let off = 0;
+  while (off + 8 <= out.length) {
+    const size = dv.getUint32(off);
+    if (size < 8) break;
+    const t = String.fromCharCode(...out.subarray(off + 4, off + 8));
+    counts[t] = (counts[t] || 0) + 1;
+    off += size;
+  }
+  return { counts, covered: off };
+}
+
+// Trafs i hver moof, læst efter flagene. Hvilke felter der står i en trun
+// afhænger af dens flag; læser testen dem forkert, måler den noget andet end
+// den tror – og en grøn test på et forkert tal er værre end ingen test.
+function readMoofs(out) {
+  const dv = new DataView(out.buffer, out.byteOffset);
+  const moofs = [];
+  let off = 0;
+  while (off + 8 <= out.length) {
+    const size = dv.getUint32(off);
+    if (size < 8) break;
+    if (String.fromCharCode(...out.subarray(off + 4, off + 8)) === 'moof') {
+      const trafs = [];
+      let p = off + 8;
+      while (p + 8 <= off + size) {
+        const sz = dv.getUint32(p);
+        if (sz < 8) break;
+        if (String.fromCharCode(...out.subarray(p + 4, p + 8)) === 'traf') {
+          trafs.push(readTraf(dv, out, p + 8, p + sz, off));
+        }
+        p += sz;
+      }
+      moofs.push({ start: off, trafs });
+    }
+    off += size;
+  }
+  return moofs;
+}
+
+function readTraf(dv, out, from, to, moofStart) {
+  const t = { trackId: 0, tfhdFlags: 0, baseTime: 0, sizes: [], durations: [], dataAt: 0 };
+  let p = from;
+  while (p + 8 <= to) {
+    const sz = dv.getUint32(p);
+    if (sz < 8) break;
+    const type = String.fromCharCode(...out.subarray(p + 4, p + 8));
+    if (type === 'tfhd') {
+      t.tfhdFlags = dv.getUint32(p + 8) & 0xffffff;
+      t.trackId = dv.getUint32(p + 12);
+    } else if (type === 'tfdt') {
+      t.baseTime = out[p + 8] === 1
+        ? Number(dv.getBigUint64(p + 12)) : dv.getUint32(p + 12);
+    } else if (type === 'trun') {
+      const fl = dv.getUint32(p + 8) & 0xffffff;
+      const count = dv.getUint32(p + 12);
+      let q = p + 16;
+      if (fl & 0x000001) { t.dataAt = moofStart + dv.getInt32(q); q += 4; }
+      if (fl & 0x000004) q += 4;
+      for (let i = 0; i < count; i++) {
+        if (fl & 0x000100) { t.durations.push(dv.getUint32(q)); q += 4; }
+        if (fl & 0x000200) { t.sizes.push(dv.getUint32(q)); q += 4; }
+        if (fl & 0x000400) q += 4;
+        if (fl & 0x000800) q += 4;
+      }
+    }
+    p += sz;
+  }
+  return t;
+}
+
+// Læser de bytes en traf peger på, sample for sample.
+function bytesOf(out, traf) {
+  const seen = [];
+  let at = traf.dataAt;
+  for (const size of traf.sizes) {
+    seen.push({ first: out[at], uniform: out.subarray(at, at + size).every((b) => b === out[at]), size });
+    at += size;
+  }
+  return seen;
+}
+
 console.log('\nfragmenteret MP4: video + lyd');
 {
+  // Lige lange fragmenter i begge spor: 4 × 6 s. Lyden har fire samples pr.
+  // fragment, så den er delt op ligesom rigtig lyd er.
   const v = makeFragmentedMp4({
     count: 4, trackId: 1, timescale: 25, step: 150, handler: 'vide',
     payload: (n) => marked(n, 500, 10)
   });
   const a = makeFragmentedMp4({
     count: 4, trackId: 1, timescale: 48000, step: 288000, handler: 'soun',
-    payload: (n) => marked(n, 200, 100)
+    samples: 4, payload: (n) => marked(n, 200, 100)
   });
   const out = concat(MUX.mux([v.bytes], [a.bytes]));
+  const { counts, covered } = topCounts(out);
+  const moofs = readMoofs(out);
 
-  // Fragmenterne i den samlede fil, i den rækkefølge de står.
-  const frags = [];
-  let off = 0;
-  const counts = {};
-  while (off + 8 <= out.length) {
-    const size = new DataView(out.buffer, out.byteOffset).getUint32(off);
-    const t = String.fromCharCode(...out.subarray(off + 4, off + 8));
-    counts[t] = (counts[t] || 0) + 1;
-    if (t === 'moof') {
-      const m = out.subarray(off, off + size);
-      const dv = new DataView(m.buffer, m.byteOffset);
-      let seq = -1;
-      const ids = [], offsets = [], tfhdFlags = [];
-      for (let i = 0; i + 8 < m.length; i++) {
-        const bt = String.fromCharCode(...m.subarray(i + 4, i + 8));
-        if (bt === 'mfhd') seq = dv.getUint32(i + 12);
-        if (bt === 'tfhd') {
-          ids.push(dv.getUint32(i + 12));
-          tfhdFlags.push(dv.getUint32(i + 8) & 0xffffff);
-        }
-        // trun med flag 0x201: sample_count, data_offset, sample_size
-        // trun: size, type, version/flags, sample_count, data_offset, sample_size
-        if (bt === 'trun') offsets.push({ at: dv.getInt32(i + 16), len: dv.getUint32(i + 20) });
-      }
-      frags.push({ seq, ids, offsets, tfhdFlags, start: off, size });
-    }
-    if (size < 8) break;
-    off += size;
-  }
-
-  ok('boksene dækker filen præcist', off === out.length, `${off} af ${out.length}`);
+  ok('boksene dækker filen præcist', covered === out.length, `${covered} af ${out.length}`);
   ok('ét moov', counts.moov === 1, `fik ${counts.moov}`);
   ok('én moof pr. tidsinterval', counts.moof === 4, `fik ${counts.moof}`);
   ok('ét mdat pr. moof', counts.mdat === 4, `fik ${counts.mdat}`);
   ok('hver moof rummer begge spor',
-    frags.every((f) => f.ids.length === 2 && f.ids[0] === 1 && f.ids[1] === 2),
-    frags.map((f) => f.ids.join('+')).join(' '));
-  ok('mfhd-sekvensen stiger gennem hele filen',
-    frags.every((f, i) => f.seq === i + 1),
-    frags.map((f) => f.seq).join(','));
+    moofs.every((m) => m.trafs.length === 2 &&
+      m.trafs[0].trackId === 1 && m.trafs[1].trackId === 2),
+    moofs.map((m) => m.trafs.map((t) => t.trackId).join('+')).join(' '));
 
   // Uden default-base-is-moof siger ISO-standarden at ANDET spor i en moof
   // måles fra hvor det første spors data sluttede – ikke fra moof'ens start.
@@ -347,14 +410,12 @@ console.log('\nfragmenteret MP4: video + lyd');
   // rammer video stadig rigtigt (den ligger først) mens lyden læses langt
   // inde i filen: filen ser hel ud og er tavs.
   ok('hver traf siger default-base-is-moof',
-    frags.every((f) => f.tfhdFlags.length === 2 &&
-      f.tfhdFlags.every((fl) => (fl & 0x020000) !== 0)),
-    frags.map((f) => f.tfhdFlags.map((x) => '0x' + x.toString(16)).join('+')).join(' '));
+    moofs.every((m) => m.trafs.every((t) => (t.tfhdFlags & 0x020000) !== 0)),
+    moofs.map((m) => m.trafs.map((t) => '0x' + t.tfhdFlags.toString(16)).join('+')).join(' '));
 
   const ids = readTrackIds(out);
   ok('to spor i moov med hver sit id', ids.length === 2 && ids[0] !== ids[1], ids.join(','));
 
-  // mvex skal have en trex pr. spor, ellers kan lyden ikke læses.
   const trex = [];
   for (let i = 0; i + 16 < out.length; i++) {
     if (String.fromCharCode(...out.subarray(i + 4, i + 8)) === 'trex') {
@@ -367,28 +428,86 @@ console.log('\nfragmenteret MP4: video + lyd');
   // og skal ramme præcis dét sporets data i det fælles mdat. Rammer den ved
   // siden af, spiller filen video uden lyd – eller støj.
   let bad = null;
-  frags.forEach((f, i) => {
-    const want = [
-      { first: 10 + i, len: 500 },   // video-fragment i
-      { first: 100 + i, len: 200 }   // lyd-fragment i
-    ];
-    f.offsets.forEach((o, k) => {
-      const at = f.start + o.at;
-      const seen = out.subarray(at, at + o.len);
-      const okHere = o.len === want[k].len && seen.length === o.len &&
-        seen.every((b) => b === want[k].first);
-      if (!okHere && !bad) {
-        bad = `moof ${i}, traf ${k}: data_offset ${o.at} → byte ${out[at]}, ventede ${want[k].first}`;
+  moofs.forEach((m, i) => {
+    const want = [{ first: 10 + i, size: 500 }, { first: 100 + i, size: 50 }];
+    m.trafs.forEach((t, k) => {
+      for (const s of bytesOf(out, t)) {
+        if (s.first !== want[k].first || !s.uniform || s.size !== want[k].size) {
+          if (!bad) bad = `moof ${i}, traf ${k}: byte ${s.first}/${s.size}, ventede ${want[k].first}/${want[k].size}`;
+        }
       }
     });
   });
-  ok('hver trafs data_offset rammer sit eget spors data i det fælles mdat',
-    bad === null, bad);
+  ok('hver trafs data_offset rammer sit eget spors data i det fælles mdat', bad === null, bad);
 
-  // Og intet må være tabt: al mediedata skal stadig ligge i filen.
+  ok('lyden står med fire samples pr. moof',
+    moofs.every((m) => m.trafs[1].sizes.length === 4),
+    moofs.map((m) => m.trafs[1].sizes.length).join(','));
+
   const total = [...v.medias, ...a.medias].reduce((n, m) => n + m.length, 0);
-  const mdatBytes = frags.reduce((n, f) => n + f.offsets.reduce((s, o) => s + o.len, 0), 0);
+  const mdatBytes = moofs.reduce((n, m) =>
+    n + m.trafs.reduce((s, t) => s + t.sizes.reduce((x, y) => x + y, 0), 0), 0);
   ok('al mediedata er med', mdatBytes === total, `${mdatBytes} af ${total}`);
+}
+
+// Sporene er sjældent skåret i lige lange stykker: her 6 s video mod 5 s lyd.
+// Lægger man fragmenterne sammen som de kommer, beskriver de to trafs i ét
+// moof derfor hver sit stykke tid, og forskellen vokser. VLC hakkede og tabte
+// små stumper lyd af netop dét. Derfor skæres lyden om efter videoens
+// opdeling – lydens fragmenter deles og samles, så hvert moof bærer præcis de
+// samples der hører til dets stykke film.
+console.log('\nfragmenteret MP4: lyden skæres efter videoens opdeling');
+{
+  const v = makeFragmentedMp4({
+    count: 20, trackId: 1, timescale: 25, step: 150, handler: 'vide',
+    payload: (n) => marked(n, 500, 10)
+  });
+  // 24 fragmenter à 5 s med ti samples hver: 240 samples à 0,5 s.
+  const a = makeFragmentedMp4({
+    count: 24, trackId: 1, timescale: 48000, step: 240000, handler: 'soun',
+    samples: 10, payload: (n) => marked(n, 200, 100)
+  });
+  const out = concat(MUX.mux([v.bytes], [a.bytes]));
+  const moofs = readMoofs(out);
+
+  ok('én moof pr. videofragment', moofs.length === 20, `fik ${moofs.length}`);
+  ok('hver moof rummer begge spor',
+    moofs.every((m) => m.trafs.length === 2 &&
+      m.trafs[0].trackId === 1 && m.trafs[1].trackId === 2),
+    moofs.map((m) => m.trafs.length).join(','));
+
+  // Det hele handler om dette ene tal: de to spor i ét moof skal begynde på
+  // samme tid. 6 s video = 288000 enheder i lydens tidsskala.
+  const skews = moofs.map((m) =>
+    Math.abs(m.trafs[1].baseTime / 48000 - m.trafs[0].baseTime / 25));
+  ok('video og lyd begynder samme sted i hver moof',
+    Math.max(...skews) === 0, `største forskel ${Math.max(...skews)} s`);
+
+  // 12 lydsamples pr. moof – og de kommer på tværs af kildens fragmenter,
+  // som havde ti hver. Det er selve opdelingen der prøves her.
+  ok('lyden er skåret om, ikke bare flyttet',
+    moofs.every((m) => m.trafs[1].sizes.length === 12),
+    moofs.map((m) => m.trafs[1].sizes.length).join(','));
+
+  const allSizes = moofs.flatMap((m) => m.trafs[1].sizes);
+  ok('alle 240 lydsamples med, hver på 20 bytes',
+    allSizes.length === 240 && allSizes.every((x) => x === 20),
+    `${allSizes.length} samples`);
+
+  // Og de rigtige bytes skal ligge i den rigtige moof: sample nr. k stammer
+  // fra kildens fragment nr. k/10, som er fyldt med tallet 100 + k/10.
+  let wrong = null;
+  let k = 0;
+  for (const m of moofs) {
+    for (const s of bytesOf(out, m.trafs[1])) {
+      const want = 100 + Math.floor(k / 10);
+      if ((s.first !== want || !s.uniform) && !wrong) {
+        wrong = `lydsample ${k}: byte ${s.first}, ventede ${want}`;
+      }
+      k++;
+    }
+  }
+  ok('hver lydsample ligger i den moof der dækker dens tid', wrong === null, wrong);
 }
 
 // Det er sådan mux.js' egen uddata ser ud: offsets måles fra moof-starten,
