@@ -389,6 +389,11 @@ async function probeHls(url, tabId) {
   // falde på den frem for en enkelt variant (se sortCands i src/85-video.js).
   let master = false;
 
+  // Alle svar herfra bygges ét sted. Med tre spredte return-sætninger er det
+  // for let at tilføje et felt de to steder og glemme det tredje – og netop
+  // det gjorde at master-flaget aldrig nåede frem fra den vej der virkede.
+  const result = (extra) => ({ master, note: notes.join('; '), ...extra });
+
   if (/#EXT-X-STREAM-INF/.test(text)) {
     master = true;
     const variants = [];
@@ -402,13 +407,16 @@ async function probeHls(url, tabId) {
         variants.push({ bw, res: res2, url: new URL(next, url).href });
       }
     }
-    if (!variants.length) return { master, note: 'master uden kvaliteter' };
+    if (!variants.length) {
+      notes.push('master uden kvaliteter');
+      return result();
+    }
     variants.sort((a, b) => b.bw - a.bw);
     notes.push(`master, ${variants.length} kvaliteter, bedst ${variants[0].res ||
       Math.round(variants[0].bw / 1000) + ' kbps'}`);
     const vres = await probeFetchSmart(variants[0].url, null, tabId);
     if (!vres.ok) {
-      return { master, note: notes.join('; '), err: vres.error || `variant HTTP ${vres.status}` };
+      return result({ err: vres.error || `variant HTTP ${vres.status}` });
     }
     text = await vres.text();
   }
@@ -420,7 +428,7 @@ async function probeHls(url, tabId) {
   if (/#EXT-X-KEY[^\n]*METHOD=SAMPLE-AES/i.test(text)) notes.push('DRM (SAMPLE-AES)');
   else if (/#EXT-X-KEY[^\n]*METHOD=AES-128/i.test(text)) notes.push('AES-128');
   if (!/#EXT-X-ENDLIST/.test(text)) notes.push('live/uafsluttet');
-  return { dur, note: notes.join('; ') };
+  return result({ dur });
 }
 
 async function probeDash(url, tabId) {
