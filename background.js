@@ -249,8 +249,49 @@ async function record(tabId, entry) {
 async function getMedia(tabId) {
   await ensureLoaded();
   const map = mem.get(tabId);
-  if (!map) return [];
-  return [...map.values()];
+  const seen = map ? [...map.values()] : [];
+  if (seen.some((e) => !e.seg)) return seen;
+  // Lyttet med for sent: playlisten hentes én gang når afspilleren starter, og
+  // derefter kun segmenter. Er listen ryddet siden (udvidelsen genindlæst,
+  // service workeren tabte den, siden skiftede URL) ser vi aldrig playlisten
+  // igen. Men rammen der hentede den, husker det selv – i sin performance-log.
+  const found = await scanFrames(tabId);
+  for (const e of found) await record(tabId, e);
+  return [...seen, ...found.filter((f) => !seen.some((e) => e.url === f.url))];
+}
+
+// Hver rammes egen liste over hvad den har hentet (Resource Timing). Den
+// overlever alt det der kan rydde vores liste, så længe rammen står. Bufferen
+// tager de første ~250 kald og smider resten – så playlisten, der kommer
+// først, er med, selv når segmenterne har fyldt den op.
+async function scanFrames(tabId) {
+  if (!tabId) return [];
+  let results = [];
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => performance.getEntriesByType('resource')
+        .map((r) => [r.name, r.encodedBodySize || 0])
+    });
+  } catch (_) {
+    return [];
+  }
+  const out = [];
+  for (const fr of results) {
+    for (const [url, size] of fr.result || []) {
+      const kind = classify(url, '');
+      if (!kind) continue;
+      let path = '';
+      try { path = new URL(url).pathname.toLowerCase(); } catch (_) {}
+      out.push({
+        url, kind, size,
+        seg: kind === 'file' && isSegmentFile(path, url),
+        frameId: fr.frameId >= 0 ? fr.frameId : 0,
+        ts: Date.now()
+      });
+    }
+  }
+  return out;
 }
 
 // ------------------------------------------------------- hent via siden ---

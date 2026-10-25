@@ -234,6 +234,13 @@ node test/mux.js
 - Bruger afspilleren streaming, er `src` en `blob:`-URL der er ubrugelig uden for
   siden. Derfor lytter baggrunds-workeren med på fanens netværkstrafik og noterer
   de playlister/mediefiler den ser (`webRequest` — kun observerende, intet blokeres).
+- **Kom Webfang for sent til**, er playlisten væk fra listen: den hentes én
+  gang når afspilleren starter, og bagefter kun segmenter (som sorteres fra).
+  Det sker når udvidelsen er genindlæst, service workeren har tabt listen,
+  eller siden har skiftet URL undervejs (det rydder listen). Er der så kun
+  segmenter eller ingenting, læses hver rammes egen `performance`-log
+  (Resource Timing), som stadig husker playlisten — også inde i afspillerens
+  iframe, og med rammens id, så 403-omvejen virker som før.
 - **Kilderne rangeres, ikke bare måles på størrelsen.** En side med et galleri
   af videoer henter forhåndsvisninger for hvert miniaturebillede, og en stream
   henter sine stumper som `.mp4`-filer — så listen kan sagtens rumme 30+ URL'er.
